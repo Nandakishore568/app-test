@@ -400,7 +400,12 @@ echo "  Required services:"
 SERVICE_ROWS="$(printf '%s' "$RESULT_JSON" | python3 -c '
 import json, sys
 for svc in json.load(sys.stdin).get("RequiredServices", []):
-    print(f"{svc.get(\"Name\",\"\")}|{svc.get(\"Exists\", False)}|{svc.get(\"Status\",\"\")}|{svc.get(\"DisplayName\",\"\")}")
+    print("{}|{}|{}|{}".format(
+        svc.get("Name", ""),
+        svc.get("Exists", False),
+        svc.get("Status", ""),
+        svc.get("DisplayName", "")
+    ))
 ')"
 if [ -z "$SERVICE_ROWS" ]; then
   echo "    - none requested"
