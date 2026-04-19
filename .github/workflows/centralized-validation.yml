@@ -52,7 +52,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ inputs.region }}
-          role-to-assume: arn:aws:iam::123456789012:role/your-github-actions-role
+          role-to-assume: arn:aws:iam::345362761155:role/OIDCRoleForGitHubActions
 
       - name: Run centralized validation
         env:
