@@ -15,17 +15,36 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Required command not found: $1"
 }
 
+PASS_COUNT=0
+FAIL_COUNT=0
+SKIP_COUNT=0
+TOTAL_CHECKS=0
+VALIDATION_FAILURES=0
+
+declare -a PASSED_CHECKS=()
+declare -a FAILED_CHECKS=()
+declare -a SKIPPED_CHECKS=()
+
 record_pass() {
   echo "PASS - $1"
+  PASS_COUNT=$((PASS_COUNT + 1))
+  TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+  PASSED_CHECKS+=("$1")
 }
 
 record_skip() {
   echo "SKIP - $1"
+  SKIP_COUNT=$((SKIP_COUNT + 1))
+  TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+  SKIPPED_CHECKS+=("$1")
 }
 
 record_fail() {
   echo "FAIL - $1"
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
   VALIDATION_FAILURES=$((VALIDATION_FAILURES + 1))
+  FAILED_CHECKS+=("$1")
 }
 
 compare_exact() {
@@ -70,6 +89,8 @@ is_true() {
 }
 
 require_cmd aws
+require_cmd jq
+require_cmd awk
 require_cmd python3
 
 REGION="${REGION:-${AWS_REGION:-}}"
@@ -97,7 +118,7 @@ cleanup() {
 trap cleanup EXIT
 
 log "Validating AWS caller identity..."
-aws sts get-caller-identity --output json >/dev/null 2>"$TMP_DIR/sts.err" || {
+ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>"$TMP_DIR/sts.err")" || {
   cat "$TMP_DIR/sts.err" >&2
   fail "Unable to authenticate to AWS"
 }
@@ -105,99 +126,145 @@ aws sts get-caller-identity --output json >/dev/null 2>"$TMP_DIR/sts.err" || {
 log "Resolving target instance..."
 
 if [ -n "$INSTANCE_ID" ]; then
-  DESCRIBE_JSON="$(aws ec2 describe-instances \
+  INSTANCE_JSON="$(aws ec2 describe-instances \
     --region "$REGION" \
     --instance-ids "$INSTANCE_ID" \
     --output json 2>"$TMP_DIR/describe.err")" || {
       cat "$TMP_DIR/describe.err" >&2
       fail "aws ec2 describe-instances failed"
     }
+
+  MATCHED_INSTANCE="$(printf '%s' "$INSTANCE_JSON" | jq -c --arg iid "$INSTANCE_ID" '
+    [ .Reservations[].Instances[] | select(.InstanceId == $iid) ][0]
+  ')" || fail "Failed to parse EC2 describe output"
 else
-  DESCRIBE_JSON="$(aws ec2 describe-instances \
+  INSTANCE_JSON="$(aws ec2 describe-instances \
     --region "$REGION" \
-    --filters "Name=tag:Name,Values=$SERVER_NAME" \
-              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
     --output json 2>"$TMP_DIR/describe.err")" || {
       cat "$TMP_DIR/describe.err" >&2
       fail "aws ec2 describe-instances failed"
     }
+
+  MATCHED_INSTANCE="$(printf '%s' "$INSTANCE_JSON" | jq -c --arg name "${SERVER_NAME,,}" '
+    [ .Reservations[].Instances[]
+      | select(
+          .State.Name == "running"
+          and any(.Tags[]?; .Key == "Name" and ((.Value // "") | ascii_downcase) == $name)
+        )
+    ][0]
+  ')" || fail "Failed to parse EC2 describe output"
 fi
 
-[ -n "$DESCRIBE_JSON" ] || fail "aws ec2 describe-instances returned empty output"
+if [ -z "$MATCHED_INSTANCE" ] || [ "$MATCHED_INSTANCE" = "null" ]; then
+  fail "No matching instance found"
+fi
 
-TARGET_JSON="$(printf '%s' "$DESCRIBE_JSON" | python3 -c '
-import json, sys
+TARGET_INSTANCE_ID="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.InstanceId')"
+TARGET_NAME="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '[.Tags[]? | select(.Key=="Name") | .Value][0] // ""')"
+TARGET_STATE="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.State.Name // "unknown"')"
+TARGET_PLATFORM="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.PlatformDetails // .Platform // ""')"
 
-instance_id = sys.argv[1]
-server_name = sys.argv[2]
+VPC_ID="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.VpcId // ""')"
+SUBNET_ID="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.SubnetId // ""')"
+INSTANCE_TYPE="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.InstanceType // ""')"
+EBS_COUNT="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.BlockDeviceMappings | length')"
 
-data = json.load(sys.stdin)
-instances = []
-for reservation in data.get("Reservations", []):
-    instances.extend(reservation.get("Instances", []))
+PRIMARY_IP="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.NetworkInterfaces[0].PrivateIpAddress // .PrivateIpAddress // "N/A"')"
+SECONDARY_IPS="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '[.NetworkInterfaces[0].PrivateIpAddresses[]? | select(.Primary==false) | .PrivateIpAddress] | join(",")')"
+if [ -z "$SECONDARY_IPS" ]; then
+  SECONDARY_IPS="None"
+fi
 
-if not instances:
-    print("No instances returned from EC2 describe call", file=sys.stderr)
-    sys.exit(1)
+SG_IDS="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '[.SecurityGroups[]?.GroupId] | join(",")')"
+SG_NAMES="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '[.SecurityGroups[]?.GroupName] | join(",")')"
+[ -n "$SG_IDS" ] || SG_IDS="None"
+[ -n "$SG_NAMES" ] || SG_NAMES="None"
 
-def name_tag(instance):
-    for tag in instance.get("Tags", []):
-        if tag.get("Key") == "Name":
-            return tag.get("Value", "")
-    return ""
+VPC_NAME="$(aws ec2 describe-tags \
+  --filters "Name=resource-id,Values=$VPC_ID" "Name=key,Values=Name" \
+  --region "$REGION" \
+  --query "Tags[0].Value" \
+  --output text 2>/dev/null || true)"
+if [ -z "$VPC_NAME" ] || [ "$VPC_NAME" = "None" ]; then
+  VPC_NAME="(No Name tag)"
+fi
 
-if instance_id:
-    matches = [i for i in instances if i.get("InstanceId") == instance_id]
-else:
-    matches = [i for i in instances if name_tag(i) == server_name]
-    if len(matches) > 1:
-        print("More than one instance matched SERVER_NAME; use INSTANCE_ID instead", file=sys.stderr)
-        sys.exit(1)
+SUBNET_NAME="$(aws ec2 describe-tags \
+  --filters "Name=resource-id,Values=$SUBNET_ID" "Name=key,Values=Name" \
+  --region "$REGION" \
+  --query "Tags[0].Value" \
+  --output text 2>/dev/null || true)"
+if [ -z "$SUBNET_NAME" ] || [ "$SUBNET_NAME" = "None" ]; then
+  SUBNET_NAME="(No Name tag)"
+fi
 
-if not matches:
-    print("Instance not found", file=sys.stderr)
-    sys.exit(1)
+INSTANCE_TYPE_JSON="$(aws ec2 describe-instance-types \
+  --instance-types "$INSTANCE_TYPE" \
+  --region "$REGION" \
+  --output json 2>"$TMP_DIR/itype.err")" || {
+    cat "$TMP_DIR/itype.err" >&2
+    fail "aws ec2 describe-instance-types failed"
+  }
 
-instance = matches[0]
-result = {
-    "InstanceId": instance.get("InstanceId", ""),
-    "Name": name_tag(instance),
-    "State": instance.get("State", {}).get("Name", "unknown"),
-    "PlatformDetails": instance.get("PlatformDetails") or instance.get("Platform") or "",
-    "PrivateIpAddress": instance.get("PrivateIpAddress", ""),
-    "InstanceType": instance.get("InstanceType", ""),
-    "VpcId": instance.get("VpcId", ""),
-    "SubnetId": instance.get("SubnetId", ""),
-    "AvailabilityZone": instance.get("Placement", {}).get("AvailabilityZone", ""),
-    "LaunchTime": instance.get("LaunchTime", "")
-}
-print(json.dumps(result))
-' "${INSTANCE_ID:-}" "${SERVER_NAME:-}")" || fail "instance not found"
+VCPU="$(printf '%s' "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].VCpuInfo.DefaultVCpus // "N/A"')"
+RAM_MiB="$(printf '%s' "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].MemoryInfo.SizeInMiB // 0')"
+RAM_GiB="$(awk "BEGIN {printf \"%.2f\", $RAM_MiB/1024}")"
 
-TARGET_INSTANCE_ID="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["InstanceId"])')"
-TARGET_NAME="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Name"])')"
-TARGET_STATE="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["State"])')"
-TARGET_PLATFORM="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["PlatformDetails"])')"
-TARGET_PRIVATE_IP="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["PrivateIpAddress"])')"
-TARGET_INSTANCE_TYPE="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["InstanceType"])')"
-TARGET_VPC_ID="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["VpcId"])')"
-TARGET_SUBNET_ID="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["SubnetId"])')"
-TARGET_AZ="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AvailabilityZone"])')"
-TARGET_LAUNCH_TIME="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["LaunchTime"])')"
+HEALTH_JSON="$(aws ec2 describe-instance-status \
+  --instance-ids "$TARGET_INSTANCE_ID" \
+  --include-all-instances \
+  --region "$REGION" \
+  --output json 2>"$TMP_DIR/health.err")" || {
+    cat "$TMP_DIR/health.err" >&2
+    fail "aws ec2 describe-instance-status failed"
+  }
 
-log "EC2 instance details:"
-echo "  InstanceId       : $TARGET_INSTANCE_ID"
-echo "  Name tag         : ${TARGET_NAME:-N/A}"
-echo "  State            : ${TARGET_STATE:-N/A}"
-echo "  Platform         : ${TARGET_PLATFORM:-N/A}"
-echo "  Private IP       : ${TARGET_PRIVATE_IP:-N/A}"
-echo "  Instance type    : ${TARGET_INSTANCE_TYPE:-N/A}"
-echo "  VPC ID           : ${TARGET_VPC_ID:-N/A}"
-echo "  Subnet ID        : ${TARGET_SUBNET_ID:-N/A}"
-echo "  AvailabilityZone : ${TARGET_AZ:-N/A}"
-echo "  LaunchTime       : ${TARGET_LAUNCH_TIME:-N/A}"
+SYSTEM_STATUS="$(printf '%s' "$HEALTH_JSON" | jq -r '.InstanceStatuses[0].SystemStatus.Status // "N/A"')"
+INSTANCE_STATUS="$(printf '%s' "$HEALTH_JSON" | jq -r '.InstanceStatuses[0].InstanceStatus.Status // "N/A"')"
 
-VALIDATION_FAILURES=0
+log "Server attributes"
+printf "\n%-20s %-15s %-20s %-15s %-20s %-20s %-15s %-10s %-10s %-10s %-10s %-25s %-30s %-15s %-15s %-30s\n" \
+"Server Name" "Region" "Instance ID" "Account ID" "VPC Name" "Subnet Name" "Primary IP" "EBS Cnt" "Type" "vCPUs" "RAM(GB)" "SG Names" "SG IDs" "SysHealth" "InstHealth" "Sec. IPs"
+
+echo "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+
+printf "%-20s %-15s %-20s %-15s %-20s %-20s %-15s %-10s %-10s %-10s %-10s %-25s %-30s %-15s %-15s %-30s\n" \
+"${TARGET_NAME:-N/A}" "$REGION" "$TARGET_INSTANCE_ID" "$ACCOUNT_ID" "$VPC_NAME" "$SUBNET_NAME" "$PRIMARY_IP" "$EBS_COUNT" "$INSTANCE_TYPE" "$VCPU" "$RAM_GiB" "$SG_NAMES" "$SG_IDS" "$SYSTEM_STATUS" "$INSTANCE_STATUS" "$SECONDARY_IPS"
+
+echo -e "\nDevice Name     Volume ID            Type       Size(GB)   IOPS       Encrypted"
+echo    "--------------------------------------------------------------------------------"
+
+BLOCK_DEVICE_ROWS="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.BlockDeviceMappings[]? | [.DeviceName, .Ebs.VolumeId] | @tsv')"
+if [ -z "$BLOCK_DEVICE_ROWS" ]; then
+  echo "No EBS volumes found."
+else
+  while IFS=$'\t' read -r device volumeid; do
+    [ -n "$volumeid" ] || continue
+    VOLUME_JSON="$(aws ec2 describe-volumes --volume-ids "$volumeid" --region "$REGION" --output json 2>"$TMP_DIR/volume-$volumeid.err")" || {
+      cat "$TMP_DIR/volume-$volumeid.err" >&2
+      fail "aws ec2 describe-volumes failed for $volumeid"
+    }
+
+    VTYPE="$(printf '%s' "$VOLUME_JSON" | jq -r '.Volumes[0].VolumeType // "N/A"')"
+    VSIZE="$(printf '%s' "$VOLUME_JSON" | jq -r '.Volumes[0].Size // "N/A"')"
+    VIOPS="$(printf '%s' "$VOLUME_JSON" | jq -r '.Volumes[0].Iops // "N/A"')"
+    VENCRYPTED="$(printf '%s' "$VOLUME_JSON" | jq -r '.Volumes[0].Encrypted // "N/A"')"
+
+    printf "%-15s %-20s %-10s %-10s %-10s %-10s\n" "$device" "$volumeid" "$VTYPE" "$VSIZE" "$VIOPS" "$VENCRYPTED"
+  done <<< "$BLOCK_DEVICE_ROWS"
+fi
+
+echo -e "\nTag Key                        Tag Value"
+echo    "----------------------------------------------------------"
+
+TAG_ROWS="$(printf '%s' "$MATCHED_INSTANCE" | jq -r '.Tags[]? | [.Key, .Value] | @tsv')"
+if [ -z "$TAG_ROWS" ]; then
+  echo "No tags found."
+else
+  while IFS=$'\t' read -r key value; do
+    printf "%-30s %-50s\n" "$key" "$value"
+  done <<< "$TAG_ROWS"
+fi
 
 log "Running EC2-level checks..."
 if [ "$TARGET_STATE" = "running" ]; then
@@ -212,10 +279,10 @@ else
   fail "Target instance is not Windows"
 fi
 
-if [ -n "$TARGET_PRIVATE_IP" ]; then
-  record_pass "Private IP is populated"
+if [ -n "$PRIMARY_IP" ] && [ "$PRIMARY_IP" != "N/A" ]; then
+  record_pass "Primary private IP is populated"
 else
-  record_fail "Private IP is missing"
+  record_fail "Primary private IP is missing"
 fi
 
 compare_exact "InstanceId" "$INSTANCE_ID" "$TARGET_INSTANCE_ID"
@@ -223,7 +290,9 @@ compare_case_insensitive "EC2 Name tag" "$SERVER_NAME" "$TARGET_NAME"
 
 log "Building SSM command payload..."
 python3 - "$TMP_DIR/ssm-parameters.json" "$REQUIRED_SERVICES_CSV" "$DNS_NAME_TO_RESOLVE" <<'PY'
-import json, sys
+# Code Generated by Sidekick is for learning and experimentation purposes only.
+import json
+import sys
 
 path = sys.argv[1]
 required_services_csv = sys.argv[2]
@@ -338,9 +407,9 @@ INVOCATION_JSON="$(aws ssm get-command-invocation \
     fail "Failed to get SSM command invocation details"
   }
 
-FINAL_STATUS="$(printf '%s' "$INVOCATION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Status",""))')"
-STDOUT_CONTENT="$(printf '%s' "$INVOCATION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("StandardOutputContent",""))')"
-STDERR_CONTENT="$(printf '%s' "$INVOCATION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("StandardErrorContent",""))')"
+FINAL_STATUS="$(printf '%s' "$INVOCATION_JSON" | jq -r '.Status // ""')"
+STDOUT_CONTENT="$(printf '%s' "$INVOCATION_JSON" | jq -r '.StandardOutputContent // ""')"
+STDERR_CONTENT="$(printf '%s' "$INVOCATION_JSON" | jq -r '.StandardErrorContent // ""')"
 
 if [ "$FINAL_STATUS" != "Success" ]; then
   [ -n "$STDERR_CONTENT" ] && printf '%s\n' "$STDERR_CONTENT" >&2
@@ -349,44 +418,36 @@ fi
 
 [ -n "$STDOUT_CONTENT" ] || fail "SSM command succeeded but returned empty output"
 
-RESULT_JSON="$(printf '%s' "$STDOUT_CONTENT" | python3 -c '
-import json, sys
+RESULT_JSON="$(printf '%s' "$STDOUT_CONTENT" | jq -c . 2>/dev/null)" || fail "SSM output was not valid JSON"
 
-raw = sys.stdin.read().strip()
-data = json.loads(raw)
+printf '%s' "$RESULT_JSON" | jq -e '
+  has("Hostname")
+  and has("Domain")
+  and has("TimeZone")
+  and has("RequiredServices")
+  and has("DnsResolvedIPs")
+' >/dev/null || fail "SSM output missing expected keys"
 
-required = ["Hostname", "Domain", "TimeZone", "RequiredServices", "DnsResolvedIPs"]
-for key in required:
-    if key not in data:
-        print(f"Missing expected key in SSM output: {key}", file=sys.stderr)
-        sys.exit(1)
+ACTUAL_HOSTNAME="$(printf '%s' "$RESULT_JSON" | jq -r '.Hostname // ""')"
+ACTUAL_DOMAIN="$(printf '%s' "$RESULT_JSON" | jq -r '.Domain // ""')"
+ACTUAL_TIMEZONE="$(printf '%s' "$RESULT_JSON" | jq -r '.TimeZone // ""')"
+ACTUAL_PART_OF_DOMAIN="$(printf '%s' "$RESULT_JSON" | jq -r '.PartOfDomain // ""')"
+ACTUAL_OS_NAME="$(printf '%s' "$RESULT_JSON" | jq -r '.OSName // ""')"
+ACTUAL_OS_VERSION="$(printf '%s' "$RESULT_JSON" | jq -r '.OSVersion // ""')"
+ACTUAL_LAST_BOOT="$(printf '%s' "$RESULT_JSON" | jq -r '.LastBootUpTime // ""')"
 
-print(json.dumps(data))
-')" || fail "SSM output was not valid JSON"
+log "Collected in-instance OS details:"
+echo "  Hostname       : ${ACTUAL_HOSTNAME:-N/A}"
+echo "  Domain         : ${ACTUAL_DOMAIN:-N/A}"
+echo "  PartOfDomain   : ${ACTUAL_PART_OF_DOMAIN:-N/A}"
+echo "  TimeZone       : ${ACTUAL_TIMEZONE:-N/A}"
+echo "  OS Name        : ${ACTUAL_OS_NAME:-N/A}"
+echo "  OS Version     : ${ACTUAL_OS_VERSION:-N/A}"
+echo "  LastBootUpTime : ${ACTUAL_LAST_BOOT:-N/A}"
 
-ACTUAL_HOSTNAME="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Hostname"])')"
-ACTUAL_DOMAIN="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Domain"])')"
-ACTUAL_TIMEZONE="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["TimeZone"])')"
-ACTUAL_PART_OF_DOMAIN="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("PartOfDomain","")))')"
-ACTUAL_OS_NAME="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("OSName",""))')"
-ACTUAL_OS_VERSION="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("OSVersion",""))')"
-ACTUAL_LAST_BOOT="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("LastBootUpTime",""))')"
+echo "  DNS Query      : ${DNS_NAME_TO_RESOLVE:-N/A}"
 
-log "Collected in-instance details:"
-echo "  Hostname         : $ACTUAL_HOSTNAME"
-echo "  Domain           : $ACTUAL_DOMAIN"
-echo "  PartOfDomain     : $ACTUAL_PART_OF_DOMAIN"
-echo "  TimeZone         : $ACTUAL_TIMEZONE"
-echo "  OS Name          : ${ACTUAL_OS_NAME:-N/A}"
-echo "  OS Version       : ${ACTUAL_OS_VERSION:-N/A}"
-echo "  LastBootUpTime   : ${ACTUAL_LAST_BOOT:-N/A}"
-
-echo "  DNS Query        : ${DNS_NAME_TO_RESOLVE:-N/A}"
-mapfile -t DNS_IPS < <(printf '%s' "$RESULT_JSON" | python3 -c '
-import json, sys
-for ip in json.load(sys.stdin).get("DnsResolvedIPs", []):
-    print(ip)
-')
+mapfile -t DNS_IPS < <(printf '%s' "$RESULT_JSON" | jq -r '.DnsResolvedIPs[]?')
 if [ "${#DNS_IPS[@]}" -eq 0 ]; then
   echo "  DNS Resolved IPs : none"
 else
@@ -397,26 +458,18 @@ else
 fi
 
 echo "  Required services:"
-SERVICE_ROWS="$(printf '%s' "$RESULT_JSON" | python3 -c '
-import json, sys
-for svc in json.load(sys.stdin).get("RequiredServices", []):
-    print("{}|{}|{}|{}".format(
-        svc.get("Name", ""),
-        svc.get("Exists", False),
-        svc.get("Status", ""),
-        svc.get("DisplayName", "")
-    ))
-')"
-if [ -z "$SERVICE_ROWS" ]; then
+mapfile -t SERVICE_ROWS < <(printf '%s' "$RESULT_JSON" | jq -r '.RequiredServices[]? | [.Name, (.Exists|tostring), .Status, .DisplayName] | @tsv')
+if [ "${#SERVICE_ROWS[@]}" -eq 0 ]; then
   echo "    - none requested"
 else
-  while IFS='|' read -r name exists status display_name; do
+  for row in "${SERVICE_ROWS[@]}"; do
+    IFS=$'\t' read -r name exists status display_name <<< "$row"
     [ -n "$name" ] || continue
     echo "    - $name : exists=$exists status=$status"
-  done <<< "$SERVICE_ROWS"
+  done
 fi
 
-log "Running validation checks..."
+log "Running OS-level checks..."
 compare_case_insensitive "Hostname" "$EXPECTED_HOSTNAME" "$ACTUAL_HOSTNAME"
 compare_case_insensitive "Domain" "$EXPECTED_DOMAIN" "$ACTUAL_DOMAIN"
 compare_exact "TimeZone" "$EXPECTED_TIMEZONE" "$ACTUAL_TIMEZONE"
@@ -427,16 +480,16 @@ if [ -n "$DNS_NAME_TO_RESOLVE" ]; then
   else
     DNS_MATCHED="false"
     for ip in "${DNS_IPS[@]}"; do
-      if [ "$ip" = "$TARGET_PRIVATE_IP" ]; then
+      if [ "$ip" = "$PRIMARY_IP" ]; then
         DNS_MATCHED="true"
         break
       fi
     done
 
     if [ "$DNS_MATCHED" = "true" ]; then
-      record_pass "DNS name '$DNS_NAME_TO_RESOLVE' resolves to the instance private IP"
+      record_pass "DNS name '$DNS_NAME_TO_RESOLVE' resolves to the instance primary private IP"
     else
-      record_fail "DNS name '$DNS_NAME_TO_RESOLVE' resolved, but not to private IP '$TARGET_PRIVATE_IP'"
+      record_fail "DNS name '$DNS_NAME_TO_RESOLVE' resolved, but not to primary private IP '$PRIMARY_IP'"
     fi
   fi
 else
@@ -444,20 +497,54 @@ else
 fi
 
 if [ -n "$REQUIRED_SERVICES_CSV" ]; then
-  while IFS='|' read -r name exists status display_name; do
-    [ -n "$name" ] || continue
+  if [ "${#SERVICE_ROWS[@]}" -eq 0 ]; then
+    record_fail "No required service results were returned"
+  else
+    for row in "${SERVICE_ROWS[@]}"; do
+      IFS=$'\t' read -r name exists status display_name <<< "$row"
+      [ -n "$name" ] || continue
 
-    if [ "${exists,,}" != "true" ]; then
-      record_fail "Service '$name' not found"
-    elif [ "${status,,}" = "running" ]; then
-      record_pass "Service '$name' is running"
-    else
-      record_fail "Service '$name' status is '$status' not 'Running'"
-    fi
-  done <<< "$SERVICE_ROWS"
+      if [ "${exists,,}" != "true" ]; then
+        record_fail "Service '$name' not found"
+      elif [ "${status,,}" = "running" ]; then
+        record_pass "Service '$name' is running"
+      else
+        record_fail "Service '$name' status is '$status' not 'Running'"
+      fi
+    done
+  fi
 else
   record_skip "Required services check (no REQUIRED_SERVICES_CSV supplied)"
 fi
+
+echo
+echo "Validation summary:"
+echo "  Total checks : $TOTAL_CHECKS"
+echo "  Passed       : $PASS_COUNT"
+echo "  Failed       : $FAIL_COUNT"
+echo "  Skipped      : $SKIP_COUNT"
+
+if [ "${#FAILED_CHECKS[@]}" -gt 0 ]; then
+  echo "  Failed check details:"
+  for item in "${FAILED_CHECKS[@]}"; do
+    echo "    - $item"
+  done
+fi
+
+if [ "${#PASSED_CHECKS[@]}" -gt 0 ]; then
+  echo "  Passed check details:"
+  for item in "${PASSED_CHECKS[@]}"; do
+    echo "    - $item"
+  done
+fi
+
+if [ "${#SKIPPED_CHECKS[@]}" -gt 0 ]; then
+  echo "  Skipped check details:"
+  for item in "${SKIPPED_CHECKS[@]}"; do
+    echo "    - $item"
+  done
+fi
+echo
 
 if [ "$VALIDATION_FAILURES" -gt 0 ]; then
   if is_true "$FAIL_ON_VALIDATION_ISSUES"; then
