@@ -7,30 +7,42 @@ on:
         description: AWS region
         required: true
         default: us-west-2
+
       server_name:
         description: EC2 Name tag
         required: false
         default: ""
+
       instance_id:
         description: EC2 instance id
         required: false
         default: ""
+
+      expected_hostname:
+        description: Expected Windows hostname
+        required: false
+        default: ""
+
       expected_timezone:
         description: Expected Windows timezone
         required: true
-        default: Mountain Standard Time
+        default: "Mountain Standard Time"
+
       expected_domain:
         description: Expected AD domain
         required: false
         default: ""
+
       dns_name_to_resolve:
         description: Optional DNS name
         required: false
         default: ""
+
       required_services_csv:
         description: Required services
         required: true
-        default: AmazonSSMAgent,AmazonCloudWatchAgent,Amsp,scaleft-server-tools
+        default: "AmazonSSMAgent,AmazonCloudWatchAgent,Amsp,scaleft-server-tools"
+
       fail_on_validation_issues:
         description: Fail if any server validation fails
         required: true
@@ -59,6 +71,7 @@ jobs:
           REGION: ${{ inputs.region }}
           SERVER_NAME: ${{ inputs.server_name }}
           INSTANCE_ID: ${{ inputs.instance_id }}
+          EXPECTED_HOSTNAME: ${{ inputs.expected_hostname }}
           EXPECTED_TIMEZONE: ${{ inputs.expected_timezone }}
           EXPECTED_DOMAIN: ${{ inputs.expected_domain }}
           DNS_NAME_TO_RESOLVE: ${{ inputs.dns_name_to_resolve }}

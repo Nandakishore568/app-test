@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
 
 log() {
@@ -14,6 +15,60 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Required command not found: $1"
 }
 
+record_pass() {
+  echo "PASS - $1"
+}
+
+record_skip() {
+  echo "SKIP - $1"
+}
+
+record_fail() {
+  echo "FAIL - $1"
+  VALIDATION_FAILURES=$((VALIDATION_FAILURES + 1))
+}
+
+compare_exact() {
+  local label="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [ -z "$expected" ]; then
+    record_skip "$label (no expected value supplied)"
+    return 0
+  fi
+
+  if [ "$expected" = "$actual" ]; then
+    record_pass "$label matches expected value"
+  else
+    record_fail "$label expected '$expected' but got '$actual'"
+  fi
+}
+
+compare_case_insensitive() {
+  local label="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [ -z "$expected" ]; then
+    record_skip "$label (no expected value supplied)"
+    return 0
+  fi
+
+  if [ "${expected,,}" = "${actual,,}" ]; then
+    record_pass "$label matches expected value"
+  else
+    record_fail "$label expected '$expected' but got '$actual'"
+  fi
+}
+
+is_true() {
+  case "${1,,}" in
+    true|1|yes|y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 require_cmd aws
 require_cmd python3
 
@@ -23,6 +78,9 @@ SERVER_NAME="${SERVER_NAME:-}"
 EXPECTED_TIMEZONE="${EXPECTED_TIMEZONE:-}"
 EXPECTED_DOMAIN="${EXPECTED_DOMAIN:-}"
 EXPECTED_HOSTNAME="${EXPECTED_HOSTNAME:-}"
+DNS_NAME_TO_RESOLVE="${DNS_NAME_TO_RESOLVE:-}"
+REQUIRED_SERVICES_CSV="${REQUIRED_SERVICES_CSV:-}"
+FAIL_ON_VALIDATION_ISSUES="${FAIL_ON_VALIDATION_ISSUES:-false}"
 POLL_SECONDS="${POLL_SECONDS:-5}"
 MAX_POLLS="${MAX_POLLS:-24}"
 
@@ -73,12 +131,7 @@ import json, sys
 instance_id = sys.argv[1]
 server_name = sys.argv[2]
 
-try:
-    data = json.load(sys.stdin)
-except json.JSONDecodeError as exc:
-    print(f"Invalid JSON from describe-instances: {exc}", file=sys.stderr)
-    sys.exit(1)
-
+data = json.load(sys.stdin)
 instances = []
 for reservation in data.get("Reservations", []):
     instances.extend(reservation.get("Instances", []))
@@ -111,7 +164,12 @@ result = {
     "Name": name_tag(instance),
     "State": instance.get("State", {}).get("Name", "unknown"),
     "PlatformDetails": instance.get("PlatformDetails") or instance.get("Platform") or "",
-    "PrivateIpAddress": instance.get("PrivateIpAddress", "")
+    "PrivateIpAddress": instance.get("PrivateIpAddress", ""),
+    "InstanceType": instance.get("InstanceType", ""),
+    "VpcId": instance.get("VpcId", ""),
+    "SubnetId": instance.get("SubnetId", ""),
+    "AvailabilityZone": instance.get("Placement", {}).get("AvailabilityZone", ""),
+    "LaunchTime": instance.get("LaunchTime", "")
 }
 print(json.dumps(result))
 ' "${INSTANCE_ID:-}" "${SERVER_NAME:-}")" || fail "instance not found"
@@ -121,25 +179,107 @@ TARGET_NAME="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(j
 TARGET_STATE="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["State"])')"
 TARGET_PLATFORM="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["PlatformDetails"])')"
 TARGET_PRIVATE_IP="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["PrivateIpAddress"])')"
+TARGET_INSTANCE_TYPE="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["InstanceType"])')"
+TARGET_VPC_ID="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["VpcId"])')"
+TARGET_SUBNET_ID="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["SubnetId"])')"
+TARGET_AZ="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AvailabilityZone"])')"
+TARGET_LAUNCH_TIME="$(printf '%s' "$TARGET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["LaunchTime"])')"
 
-log "Resolved instance: id=$TARGET_INSTANCE_ID name=${TARGET_NAME:-N/A} state=$TARGET_STATE platform=${TARGET_PLATFORM:-N/A} private_ip=${TARGET_PRIVATE_IP:-N/A}"
+log "EC2 instance details:"
+echo "  InstanceId       : $TARGET_INSTANCE_ID"
+echo "  Name tag         : ${TARGET_NAME:-N/A}"
+echo "  State            : ${TARGET_STATE:-N/A}"
+echo "  Platform         : ${TARGET_PLATFORM:-N/A}"
+echo "  Private IP       : ${TARGET_PRIVATE_IP:-N/A}"
+echo "  Instance type    : ${TARGET_INSTANCE_TYPE:-N/A}"
+echo "  VPC ID           : ${TARGET_VPC_ID:-N/A}"
+echo "  Subnet ID        : ${TARGET_SUBNET_ID:-N/A}"
+echo "  AvailabilityZone : ${TARGET_AZ:-N/A}"
+echo "  LaunchTime       : ${TARGET_LAUNCH_TIME:-N/A}"
 
-[ "$TARGET_STATE" = "running" ] || fail "Target instance must be running for SSM validation"
-printf '%s' "$TARGET_PLATFORM" | grep -iq "windows" || fail "Target instance is not Windows"
+VALIDATION_FAILURES=0
+
+log "Running EC2-level checks..."
+if [ "$TARGET_STATE" = "running" ]; then
+  record_pass "Instance state is running"
+else
+  fail "Target instance must be running for SSM validation"
+fi
+
+if printf '%s' "$TARGET_PLATFORM" | grep -iq "windows"; then
+  record_pass "Platform is Windows"
+else
+  fail "Target instance is not Windows"
+fi
+
+if [ -n "$TARGET_PRIVATE_IP" ]; then
+  record_pass "Private IP is populated"
+else
+  record_fail "Private IP is missing"
+fi
+
+compare_exact "InstanceId" "$INSTANCE_ID" "$TARGET_INSTANCE_ID"
+compare_case_insensitive "EC2 Name tag" "$SERVER_NAME" "$TARGET_NAME"
 
 log "Building SSM command payload..."
-python3 - "$TMP_DIR/ssm-parameters.json" <<'PY'
+python3 - "$TMP_DIR/ssm-parameters.json" "$REQUIRED_SERVICES_CSV" "$DNS_NAME_TO_RESOLVE" <<'PY'
 import json, sys
 
 path = sys.argv[1]
+required_services_csv = sys.argv[2]
+dns_name = sys.argv[3]
+
+def ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
 commands = [
     "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    f"$requiredServicesCsv = {ps_quote(required_services_csv)}",
+    f"$dnsName = {ps_quote(dns_name)}",
+    "$requiredServices = @()",
+    "if ($requiredServicesCsv.Trim()) { $requiredServices = $requiredServicesCsv.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ } }",
+    "$cs = Get-CimInstance Win32_ComputerSystem",
+    "$os = Get-CimInstance Win32_OperatingSystem",
     "$tz = (Get-TimeZone).Id",
-    "$domain = (Get-CimInstance Win32_ComputerSystem).Domain",
-    "$hostname = $env:COMPUTERNAME",
-    "$result = [ordered]@{ Hostname = $hostname; Domain = $domain; TimeZone = $tz }",
-    "$result | ConvertTo-Json -Compress"
+    "$services = @()",
+    "foreach ($svcName in $requiredServices) {",
+    "  $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue",
+    "  if ($null -eq $svc) {",
+    "    $services += [pscustomobject]@{ Name = $svcName; Exists = $false; Status = 'NotFound'; DisplayName = '' }",
+    "  } else {",
+    "    $services += [pscustomobject]@{ Name = $svc.Name; Exists = $true; Status = [string]$svc.Status; DisplayName = $svc.DisplayName }",
+    "  }",
+    "}",
+    "$dnsResolvedIPs = @()",
+    "if ($dnsName.Trim()) {",
+    "  try {",
+    "    $dnsResolvedIPs = Resolve-DnsName -Name $dnsName -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique",
+    "  } catch {",
+    "    try {",
+    "      $dnsResolvedIPs = [System.Net.Dns]::GetHostAddresses($dnsName) | ForEach-Object { $_.IPAddressToString } | Select-Object -Unique",
+    "    } catch {",
+    "      $dnsResolvedIPs = @()",
+    "    }",
+    "  }",
+    "}",
+    "$lastBoot = ''",
+    "try { $lastBoot = ([System.Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime)).ToString('o') } catch { $lastBoot = '' }",
+    "$result = [ordered]@{",
+    "  Hostname = $env:COMPUTERNAME;",
+    "  Domain = $cs.Domain;",
+    "  PartOfDomain = [bool]$cs.PartOfDomain;",
+    "  TimeZone = $tz;",
+    "  OSName = $os.Caption;",
+    "  OSVersion = $os.Version;",
+    "  LastBootUpTime = $lastBoot;",
+    "  RequiredServices = $services;",
+    "  DnsNameQueried = $dnsName;",
+    "  DnsResolvedIPs = @($dnsResolvedIPs)",
+    "}",
+    "$result | ConvertTo-Json -Depth 6 -Compress"
 ]
+
 with open(path, "w", encoding="utf-8") as f:
     json.dump({"commands": commands}, f)
 PY
@@ -213,13 +353,9 @@ RESULT_JSON="$(printf '%s' "$STDOUT_CONTENT" | python3 -c '
 import json, sys
 
 raw = sys.stdin.read().strip()
-try:
-    data = json.loads(raw)
-except json.JSONDecodeError:
-    print(raw, file=sys.stderr)
-    sys.exit(1)
+data = json.loads(raw)
 
-required = ["Hostname", "Domain", "TimeZone"]
+required = ["Hostname", "Domain", "TimeZone", "RequiredServices", "DnsResolvedIPs"]
 for key in required:
     if key not in data:
         print(f"Missing expected key in SSM output: {key}", file=sys.stderr)
@@ -231,56 +367,99 @@ print(json.dumps(data))
 ACTUAL_HOSTNAME="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Hostname"])')"
 ACTUAL_DOMAIN="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Domain"])')"
 ACTUAL_TIMEZONE="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["TimeZone"])')"
+ACTUAL_PART_OF_DOMAIN="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("PartOfDomain","")))')"
+ACTUAL_OS_NAME="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("OSName",""))')"
+ACTUAL_OS_VERSION="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("OSVersion",""))')"
+ACTUAL_LAST_BOOT="$(printf '%s' "$RESULT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("LastBootUpTime",""))')"
 
-log "Collected values from instance:"
-echo "  Hostname : $ACTUAL_HOSTNAME"
-echo "  Domain   : $ACTUAL_DOMAIN"
-echo "  TimeZone : $ACTUAL_TIMEZONE"
+log "Collected in-instance details:"
+echo "  Hostname         : $ACTUAL_HOSTNAME"
+echo "  Domain           : $ACTUAL_DOMAIN"
+echo "  PartOfDomain     : $ACTUAL_PART_OF_DOMAIN"
+echo "  TimeZone         : $ACTUAL_TIMEZONE"
+echo "  OS Name          : ${ACTUAL_OS_NAME:-N/A}"
+echo "  OS Version       : ${ACTUAL_OS_VERSION:-N/A}"
+echo "  LastBootUpTime   : ${ACTUAL_LAST_BOOT:-N/A}"
 
-FAILURES=0
+echo "  DNS Query        : ${DNS_NAME_TO_RESOLVE:-N/A}"
+mapfile -t DNS_IPS < <(printf '%s' "$RESULT_JSON" | python3 -c '
+import json, sys
+for ip in json.load(sys.stdin).get("DnsResolvedIPs", []):
+    print(ip)
+')
+if [ "${#DNS_IPS[@]}" -eq 0 ]; then
+  echo "  DNS Resolved IPs : none"
+else
+  echo "  DNS Resolved IPs :"
+  for ip in "${DNS_IPS[@]}"; do
+    echo "    - $ip"
+  done
+fi
 
-compare_exact() {
-  local label="$1"
-  local expected="$2"
-  local actual="$3"
+echo "  Required services:"
+SERVICE_ROWS="$(printf '%s' "$RESULT_JSON" | python3 -c '
+import json, sys
+for svc in json.load(sys.stdin).get("RequiredServices", []):
+    print(f"{svc.get(\"Name\",\"\")}|{svc.get(\"Exists\", False)}|{svc.get(\"Status\",\"\")}|{svc.get(\"DisplayName\",\"\")}")
+')"
+if [ -z "$SERVICE_ROWS" ]; then
+  echo "    - none requested"
+else
+  while IFS='|' read -r name exists status display_name; do
+    [ -n "$name" ] || continue
+    echo "    - $name : exists=$exists status=$status"
+  done <<< "$SERVICE_ROWS"
+fi
 
-  if [ -z "$expected" ]; then
-    echo "SKIP - $label (no expected value supplied)"
-    return 0
-  fi
-
-  if [ "$expected" = "$actual" ]; then
-    echo "PASS - $label matches expected value"
-  else
-    echo "FAIL - $label expected '$expected' but got '$actual'"
-    FAILURES=$((FAILURES + 1))
-  fi
-}
-
-compare_case_insensitive() {
-  local label="$1"
-  local expected="$2"
-  local actual="$3"
-
-  if [ -z "$expected" ]; then
-    echo "SKIP - $label (no expected value supplied)"
-    return 0
-  fi
-
-  if [ "${expected,,}" = "${actual,,}" ]; then
-    echo "PASS - $label matches expected value"
-  else
-    echo "FAIL - $label expected '$expected' but got '$actual'"
-    FAILURES=$((FAILURES + 1))
-  fi
-}
-
+log "Running validation checks..."
 compare_case_insensitive "Hostname" "$EXPECTED_HOSTNAME" "$ACTUAL_HOSTNAME"
 compare_case_insensitive "Domain" "$EXPECTED_DOMAIN" "$ACTUAL_DOMAIN"
 compare_exact "TimeZone" "$EXPECTED_TIMEZONE" "$ACTUAL_TIMEZONE"
 
-if [ "$FAILURES" -gt 0 ]; then
-  fail "Validation completed with $FAILURES failure(s)"
+if [ -n "$DNS_NAME_TO_RESOLVE" ]; then
+  if [ "${#DNS_IPS[@]}" -eq 0 ]; then
+    record_fail "DNS name '$DNS_NAME_TO_RESOLVE' did not resolve on the instance"
+  else
+    DNS_MATCHED="false"
+    for ip in "${DNS_IPS[@]}"; do
+      if [ "$ip" = "$TARGET_PRIVATE_IP" ]; then
+        DNS_MATCHED="true"
+        break
+      fi
+    done
+
+    if [ "$DNS_MATCHED" = "true" ]; then
+      record_pass "DNS name '$DNS_NAME_TO_RESOLVE' resolves to the instance private IP"
+    else
+      record_fail "DNS name '$DNS_NAME_TO_RESOLVE' resolved, but not to private IP '$TARGET_PRIVATE_IP'"
+    fi
+  fi
+else
+  record_skip "DNS resolution check (no DNS_NAME_TO_RESOLVE supplied)"
 fi
 
-log "Validation completed successfully"
+if [ -n "$REQUIRED_SERVICES_CSV" ]; then
+  while IFS='|' read -r name exists status display_name; do
+    [ -n "$name" ] || continue
+
+    if [ "${exists,,}" != "true" ]; then
+      record_fail "Service '$name' not found"
+    elif [ "${status,,}" = "running" ]; then
+      record_pass "Service '$name' is running"
+    else
+      record_fail "Service '$name' status is '$status' not 'Running'"
+    fi
+  done <<< "$SERVICE_ROWS"
+else
+  record_skip "Required services check (no REQUIRED_SERVICES_CSV supplied)"
+fi
+
+if [ "$VALIDATION_FAILURES" -gt 0 ]; then
+  if is_true "$FAIL_ON_VALIDATION_ISSUES"; then
+    fail "Validation completed with $VALIDATION_FAILURES failure(s)"
+  else
+    log "Validation completed with $VALIDATION_FAILURES failure(s), but continuing because FAIL_ON_VALIDATION_ISSUES=$FAIL_ON_VALIDATION_ISSUES"
+  fi
+else
+  log "Validation completed successfully"
+fi
