@@ -4,67 +4,42 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: AWS region
+        description: "AWS region"
         required: true
-        default: us-west-2
-        type: string
-      aws_role_arn:
-        description: IAM role ARN for GitHub OIDC
-        required: true
-        type: string
-      document_name:
-        description: SSM Command document name
-        required: true
-        default: Centralized-Windows-EC2-Validation
-        type: string
-      instance_id:
-        description: Target EC2 instance ID (preferred if known)
-        required: false
-        default: ""
-        type: string
+        default: "us-west-2"
       server_name:
-        description: EC2 Name tag / server name
+        description: "EC2 Name tag"
         required: false
         default: ""
-        type: string
-      dns_lookup_name:
-        description: Optional DNS name to resolve
+      instance_id:
+        description: "EC2 instance id"
         required: false
         default: ""
-        type: string
-
-permissions:
-  id-token: write
-  contents: read
 
 jobs:
-  validate-windows-ec2:
+  validate:
     runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
     env:
-      DOCUMENT_NAME: ${{ inputs.document_name }}
+      DOCUMENT_NAME: "Centralized-Windows-EC2-Validation"
 
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ inputs.region }}
-          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-to-assume: arn:aws:iam::345362761155:role/OIDCRoleForGitHubActions
 
-      - name: Verify runner tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws --version
-          jq --version
-          python3 --version
-
-      - name: 1) Resolve target instance
+      - name: 1) Server Attributes
         shell: bash
         env:
           REGION: ${{ inputs.region }}
-          INPUT_INSTANCE_ID: ${{ inputs.instance_id }}
-          INPUT_SERVER_NAME: ${{ inputs.server_name }}
-          INPUT_DNS_LOOKUP_NAME: ${{ inputs.dns_lookup_name }}
+          SERVER_NAME: ${{ inputs.server_name }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
         run: |
           set -euo pipefail
 
@@ -72,76 +47,193 @@ jobs:
             echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
           }
 
-          if [ -n "${INPUT_INSTANCE_ID:-}" ]; then
-            log "Resolving instance from instance ID: $INPUT_INSTANCE_ID"
+          print_kv_header() {
+            printf "%-26s | %s\n" "Attribute" "Value"
+            printf "%-26s-+-%s\n" "--------------------------" "---------------------------------------------------------------"
+          }
 
-            DESCRIBE_JSON="$(aws ec2 describe-instances \
-              --region "$REGION" \
-              --instance-ids "$INPUT_INSTANCE_ID" \
-              --output json)"
-          elif [ -n "${INPUT_SERVER_NAME:-}" ]; then
-            log "Resolving instance from Name tag: $INPUT_SERVER_NAME"
+          print_kv_row() {
+            printf "%-26s | %s\n" "$1" "$2"
+          }
 
-            DESCRIBE_JSON="$(aws ec2 describe-instances \
-              --region "$REGION" \
-              --filters \
-                "Name=tag:Name,Values=$INPUT_SERVER_NAME" \
-                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-              --output json)"
+          print_section_gap() {
+            printf "\n"
+          }
+
+          log "Resolving target instance..."
+
+          if [ -z "$INSTANCE_ID" ] && [ -z "$SERVER_NAME" ]; then
+            echo "Either instance_id or server_name must be provided." >&2
+            exit 1
+          fi
+
+          if [ -n "$INSTANCE_ID" ]; then
+            TARGET_INSTANCE_ID="$INSTANCE_ID"
           else
-            echo "Provide either 'instance_id' or 'server_name'." >&2
-            exit 1
-          fi
+            IDS="$(aws ec2 describe-instances \
+              --region "$REGION" \
+              --filters "Name=tag:Name,Values=$SERVER_NAME" "Name=instance-state-name,Values=running" \
+              --query "Reservations[].Instances[].InstanceId" \
+              --output text)"
 
-          MATCH_COUNT="$(echo "$DESCRIBE_JSON" | jq '[.Reservations[].Instances[]] | length')"
-
-          if [ "$MATCH_COUNT" = "0" ]; then
-            echo "No matching EC2 instance found." >&2
-            exit 1
-          fi
-
-          if [ "$MATCH_COUNT" -gt 1 ]; then
-            echo "Multiple EC2 instances matched. Use 'instance_id' for an exact target." >&2
-            exit 1
-          fi
-
-          TARGET_INSTANCE_ID="$(echo "$DESCRIBE_JSON" | jq -r '.Reservations[0].Instances[0].InstanceId')"
-          INSTANCE_NAME="$(echo "$DESCRIBE_JSON" | jq -r '.Reservations[0].Instances[0].Tags[]? | select(.Key=="Name") | .Value' | head -n1)"
-          PRIVATE_IP="$(echo "$DESCRIBE_JSON" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress // "N/A"')"
-          INSTANCE_STATE="$(echo "$DESCRIBE_JSON" | jq -r '.Reservations[0].Instances[0].State.Name // "N/A"')"
-          PLATFORM_DETAILS="$(echo "$DESCRIBE_JSON" | jq -r '.Reservations[0].Instances[0].PlatformDetails // "N/A"')"
-
-          if [ -z "${INSTANCE_NAME:-}" ] && [ -n "${INPUT_SERVER_NAME:-}" ]; then
-            INSTANCE_NAME="$INPUT_SERVER_NAME"
-          fi
-
-          DNS_LOOKUP_NAME="${INPUT_DNS_LOOKUP_NAME:-}"
-          if [ -z "${DNS_LOOKUP_NAME:-}" ]; then
-            if [ -n "${INSTANCE_NAME:-}" ]; then
-              DNS_LOOKUP_NAME="$INSTANCE_NAME"
-            else
-              DNS_LOOKUP_NAME="N/A"
+            if [ -z "$IDS" ] || [ "$IDS" = "None" ]; then
+              echo "No running instance found for server_name=$SERVER_NAME" >&2
+              exit 1
             fi
+
+            set -- $IDS
+            if [ "$#" -gt 1 ]; then
+              echo "Multiple running instances found for server_name=$SERVER_NAME. Use instance_id." >&2
+              exit 1
+            fi
+
+            TARGET_INSTANCE_ID="$1"
           fi
 
-          {
-            echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID"
-            echo "INSTANCE_NAME=${INSTANCE_NAME:-N/A}"
-            echo "DNS_LOOKUP_NAME=$DNS_LOOKUP_NAME"
-            echo "PRIVATE_IP=$PRIVATE_IP"
-            echo "INSTANCE_STATE=$INSTANCE_STATE"
-            echo "PLATFORM_DETAILS=$PLATFORM_DETAILS"
-          } >> "$GITHUB_ENV"
+          INSTANCE_JSON="$(aws ec2 describe-instances \
+            --region "$REGION" \
+            --instance-ids "$TARGET_INSTANCE_ID" \
+            --output json)"
 
-          log "Resolved target instance"
-          printf "%-26s | %s\n" "Attribute" "Value"
-          printf "%-26s-+-%s\n" "--------------------------" "----------------------------------------------------------------"
-          printf "%-26s | %s\n" "Target Instance ID" "$TARGET_INSTANCE_ID"
-          printf "%-26s | %s\n" "Server Name" "${INSTANCE_NAME:-N/A}"
-          printf "%-26s | %s\n" "Private IP" "$PRIVATE_IP"
-          printf "%-26s | %s\n" "State" "$INSTANCE_STATE"
-          printf "%-26s | %s\n" "Platform" "$PLATFORM_DETAILS"
-          printf "%-26s | %s\n" "DNS Lookup Name" "$DNS_LOOKUP_NAME"
+          INSTANCE_NAME="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Tags[]? | select(.Key=="Name") | .Value' | head -n1)"
+          [ -n "${INSTANCE_NAME:-}" ] && [ "$INSTANCE_NAME" != "null" ] || INSTANCE_NAME="N/A"
+
+          DNS_LOOKUP_NAME="$INSTANCE_NAME"
+          if [ "$DNS_LOOKUP_NAME" = "N/A" ] && [ -n "${SERVER_NAME:-}" ]; then
+            DNS_LOOKUP_NAME="$SERVER_NAME"
+          fi
+
+          echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "INSTANCE_NAME=$INSTANCE_NAME" >> "$GITHUB_ENV"
+          echo "DNS_LOOKUP_NAME=$DNS_LOOKUP_NAME" >> "$GITHUB_ENV"
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          INSTANCE_STATE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].State.Name // "N/A"')"
+          PLATFORM_DETAILS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PlatformDetails // "N/A"')"
+          PRIVATE_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress // "N/A"')"
+          PUBLIC_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PublicIpAddress // "N/A"')"
+          VPC_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].VpcId // "N/A"')"
+          SUBNET_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].SubnetId // "N/A"')"
+          INSTANCE_TYPE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].InstanceType // "N/A"')"
+          AZ="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Placement.AvailabilityZone // "N/A"')"
+
+          SECONDARY_IPS="$(echo "$INSTANCE_JSON" | jq -r '[.Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddresses[]? | select(.Primary==false) | .PrivateIpAddress] | join(", ")')"
+          [ -n "${SECONDARY_IPS:-}" ] || SECONDARY_IPS="None"
+
+          VPC_NAME="$(aws ec2 describe-tags \
+            --region "$REGION" \
+            --filters "Name=resource-id,Values=$VPC_ID" "Name=key,Values=Name" \
+            --query "Tags[0].Value" \
+            --output text 2>/dev/null || true)"
+          [ -n "${VPC_NAME:-}" ] && [ "$VPC_NAME" != "None" ] || VPC_NAME="(No Name tag)"
+
+          SUBNET_NAME="$(aws ec2 describe-tags \
+            --region "$REGION" \
+            --filters "Name=resource-id,Values=$SUBNET_ID" "Name=key,Values=Name" \
+            --query "Tags[0].Value" \
+            --output text 2>/dev/null || true)"
+          [ -n "${SUBNET_NAME:-}" ] && [ "$SUBNET_NAME" != "None" ] || SUBNET_NAME="(No Name tag)"
+
+          INSTANCE_TYPE_JSON="$(aws ec2 describe-instance-types \
+            --region "$REGION" \
+            --instance-types "$INSTANCE_TYPE" \
+            --output json)"
+
+          VCPU="$(echo "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].VCpuInfo.DefaultVCpus // "N/A"')"
+          RAM_MIB="$(echo "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].MemoryInfo.SizeInMiB // 0')"
+          RAM_GB="$(awk "BEGIN {printf \"%.2f\", $RAM_MIB/1024}")"
+
+          log "Server attributes"
+          print_kv_header
+          print_kv_row "Server Name" "$INSTANCE_NAME"
+          print_kv_row "DNS Lookup Name" "$DNS_LOOKUP_NAME"
+          print_kv_row "Region" "$REGION"
+          print_kv_row "Instance ID" "$TARGET_INSTANCE_ID"
+          print_kv_row "Account ID" "$ACCOUNT_ID"
+          print_kv_row "Instance State" "$INSTANCE_STATE"
+          print_kv_row "Platform Details" "$PLATFORM_DETAILS"
+          print_kv_row "Availability Zone" "$AZ"
+          print_kv_row "Instance Type" "$INSTANCE_TYPE"
+          print_kv_row "vCPUs" "$VCPU"
+          print_kv_row "RAM (GB)" "$RAM_GB"
+          print_kv_row "Private IP" "$PRIVATE_IP"
+          print_kv_row "Public IP" "$PUBLIC_IP"
+          print_kv_row "Secondary IPs" "$SECONDARY_IPS"
+          print_kv_row "VPC Name" "$VPC_NAME"
+          print_kv_row "VPC ID" "$VPC_ID"
+          print_kv_row "Subnet Name" "$SUBNET_NAME"
+          print_kv_row "Subnet ID" "$SUBNET_ID"
+
+          print_section_gap
+          log "Security groups attached"
+          printf "%-36s | %s\n" "Group Name" "Group ID"
+          printf "%-36s-+-%s\n" "------------------------------------" "-----------------------------"
+
+          SG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].SecurityGroups[]? |
+            [.GroupName, .GroupId] | @tsv
+          ')"
+
+          if [ -z "${SG_ROWS:-}" ]; then
+            printf "%-36s | %s\n" "N/A" "No security groups found"
+          else
+            while IFS=$'\t' read -r SG_NAME SG_ID; do
+              [ -n "${SG_NAME:-}" ] || SG_NAME="N/A"
+              [ -n "${SG_ID:-}" ] || SG_ID="N/A"
+              printf "%-36s | %s\n" "$SG_NAME" "$SG_ID"
+            done <<< "$SG_ROWS"
+          fi
+
+          print_section_gap
+          log "EBS volumes"
+          printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" "Device Name" "Volume ID" "Type" "SizeGB" "IOPS" "Encrypted"
+          printf "%-14s-+-%-21s-+-%-8s-+-%-8s-+-%-8s-+-%s\n" "--------------" "---------------------" "--------" "--------" "--------" "-----------"
+
+          BLOCK_DEVICE_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].BlockDeviceMappings[]? |
+            [.DeviceName, .Ebs.VolumeId] | @tsv
+          ')"
+
+          if [ -z "${BLOCK_DEVICE_ROWS:-}" ]; then
+            printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" "N/A" "N/A" "N/A" "N/A" "N/A" "No EBS volumes found"
+          else
+            while IFS=$'\t' read -r DEVICE VOLUME_ID; do
+              [ -n "${VOLUME_ID:-}" ] || continue
+
+              VOLUME_JSON="$(aws ec2 describe-volumes \
+                --region "$REGION" \
+                --volume-ids "$VOLUME_ID" \
+                --output json)"
+
+              VTYPE="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].VolumeType // "N/A"')"
+              VSIZE="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Size // "N/A"')"
+              VIOPS="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Iops // "N/A"')"
+              VENCRYPTED="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Encrypted // "N/A"')"
+
+              printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" \
+                "$DEVICE" "$VOLUME_ID" "$VTYPE" "$VSIZE" "$VIOPS" "$VENCRYPTED"
+            done <<< "$BLOCK_DEVICE_ROWS"
+          fi
+
+          print_section_gap
+          log "Instance tags"
+          printf "%-30s | %s\n" "Tag Key" "Tag Value"
+          printf "%-30s-+-%s\n" "------------------------------" "-----------------------------------------------------------"
+
+          TAG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].Tags[]? |
+            [.Key, .Value] | @tsv
+          ' | sort)"
+
+          if [ -z "${TAG_ROWS:-}" ]; then
+            printf "%-30s | %s\n" "N/A" "No tags found"
+          else
+            while IFS=$'\t' read -r KEY VALUE; do
+              [ -n "${KEY:-}" ] || KEY="N/A"
+              [ -n "${VALUE:-}" ] || VALUE="N/A"
+              printf "%-30s | %s\n" "$KEY" "$VALUE"
+            done <<< "$TAG_ROWS"
+          fi
 
       - name: 2) SSM Checks
         shell: bash
@@ -156,7 +248,7 @@ jobs:
 
           print_kv_header() {
             printf "%-26s | %s\n" "Attribute" "Value"
-            printf "%-26s-+-%s\n" "--------------------------" "----------------------------------------------------------------"
+            printf "%-26s-+-%s\n" "--------------------------" "---------------------------------------------------------------"
           }
 
           print_kv_row() {
@@ -261,131 +353,9 @@ jobs:
           print_kv_row "Status" "${FINAL_STATUS:-$STATUS_DETAILS}"
           print_kv_row "Response Code" "$RESPONSE_CODE"
 
-          export STANDARD_OUTPUT
-
-          python3 <<'PY'
-          import os
-          import re
-          import subprocess
-
-          def utc_now():
-              return subprocess.check_output(
-                  ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
-                  text=True
-              ).strip()
-
-          text = os.environ.get("STANDARD_OUTPUT", "").replace("\r", "")
-          lines = [line.rstrip() for line in text.splitlines()]
-
-          system_rows = []
-          dns_rows = []
-          service_rows = []
-          disk_rows = []
-
-          current = None
-          pending_dns = None
-
-          for raw in lines:
-              line = raw.strip()
-              if not line:
-                  continue
-              if re.fullmatch(r'-{2,}', line):
-                  continue
-
-              if line == "System":
-                  current = "system"
-                  pending_dns = None
-                  continue
-              elif line == "DNS Resolution":
-                  current = "dns"
-                  pending_dns = None
-                  continue
-              elif line == "Service Status":
-                  current = "service"
-                  pending_dns = None
-                  continue
-              elif line == "Disk Details":
-                  current = "disk"
-                  pending_dns = None
-                  continue
-
-              if current == "system":
-                  m = re.match(r'^(.*?)\s*:\s*(.*)$', line)
-                  if m:
-                      system_rows.append((m.group(1).strip(), m.group(2).strip() or "N/A"))
-
-              elif current == "dns":
-                  if line.startswith("nslookup "):
-                      pending_dns = line
-                  elif line.startswith("-") and pending_dns:
-                      dns_rows.append((pending_dns, line.lstrip("-").strip() or "N/A"))
-                      pending_dns = None
-
-              elif current == "service":
-                  m = re.match(r'^-\s*(.*?)\s+exists=(\S+)\s+status=(\S+)$', line)
-                  if m:
-                      service_rows.append((m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
-
-              elif current == "disk":
-                  if line.startswith("-"):
-                      content = line.lstrip("-").strip()
-                      pairs = dict(re.findall(r'(\w+)=([^\s]+)', content))
-                      disk_rows.append((
-                          pairs.get("Drive", "N/A"),
-                          pairs.get("VolumeName", "N/A"),
-                          pairs.get("FileSystem", "N/A"),
-                          pairs.get("SizeGB", "N/A"),
-                          pairs.get("FreeGB", "N/A"),
-                      ))
-
-          def gap():
-              print()
-
-          def print_table(title, headers, rows, widths):
-              gap()
-              print(f"[{utc_now()}] {title}")
-              print(" | ".join(f"{h:<{w}}" for h, w in zip(headers, widths)))
-              print("-+-".join("-" * w for w in widths))
-              for row in rows:
-                  print(" | ".join(f"{str(v):<{w}}" for v, w in zip(row, widths)))
-
-          if system_rows:
-              print_table(
-                  "SSM output - System",
-                  ["Attribute", "Value"],
-                  system_rows,
-                  [26, 64]
-              )
-
-          if dns_rows:
-              print_table(
-                  "SSM output - DNS Resolution",
-                  ["Command", "Output"],
-                  dns_rows,
-                  [38, 64]
-              )
-
-          if service_rows:
-              print_table(
-                  "SSM output - Service Status",
-                  ["Service", "Exists", "Status"],
-                  service_rows,
-                  [28, 10, 16]
-              )
-
-          if disk_rows:
-              print_table(
-                  "SSM output - Disk Details",
-                  ["Drive", "VolumeName", "FileSystem", "SizeGB", "FreeGB"],
-                  disk_rows,
-                  [10, 15, 10, 8, 8]
-              )
-
-          if not any([system_rows, dns_rows, service_rows, disk_rows]):
-              gap()
-              print(f"[{utc_now()}] SSM document output")
-              print(text if text.strip() else "(no output)")
-          PY
+          print_section_gap
+          log "SSM document output"
+          printf "%s\n" "${STANDARD_OUTPUT:-"(no output)"}"
 
           if [ -n "${STANDARD_ERROR:-}" ]; then
             print_section_gap
