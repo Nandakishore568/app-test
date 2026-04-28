@@ -233,7 +233,7 @@ jobs:
               [ -n "${VALUE:-}" ] || VALUE="N/A"
               printf "%-30s | %s\n" "$KEY" "$VALUE"
             done <<< "$TAG_ROWS"
-          done
+          fi
 
       - name: 2) SSM Checks
         shell: bash
