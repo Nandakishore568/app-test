@@ -1,4 +1,4 @@
-name: Centralized Windows EC2 Details
+name: Centralized-Windows-EC2-Validation
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
       contents: read
 
     env:
-      DOCUMENT_NAME: "Centralized-Windows-EC2-Details"
+      DOCUMENT_NAME: "Centralized-Windows-EC2-Validation"
 
     steps:
       - name: Configure AWS credentials
