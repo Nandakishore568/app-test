@@ -1,4 +1,4 @@
-name: Centralized Windows EC2 Validation
+name: Centralized Multi Windows EC2 Validation
 
 on:
   workflow_dispatch:
