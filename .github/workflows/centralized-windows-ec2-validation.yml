@@ -15,6 +15,10 @@ on:
         description: "EC2 instance id"
         required: false
         default: ""
+      dns_name_to_resolve:
+        description: "Hostname for nslookup forward lookup"
+        required: false
+        default: ""
 
 jobs:
   validate:
@@ -40,11 +44,21 @@ jobs:
           REGION: ${{ inputs.region }}
           SERVER_NAME: ${{ inputs.server_name }}
           INSTANCE_ID: ${{ inputs.instance_id }}
+          DNS_NAME_TO_RESOLVE: ${{ inputs.dns_name_to_resolve }}
         run: |
           set -euo pipefail
 
           log() {
             echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
+          }
+
+          print_kv_header() {
+            printf "%-26s | %s\n" "Attribute" "Value"
+            printf "%-26s-+-%s\n" "--------------------------" "--------------------------------------------------------------"
+          }
+
+          print_kv_row() {
+            printf "%-26s | %s\n" "$1" "$2"
           }
 
           log "Resolving target instance..."
@@ -107,22 +121,15 @@ jobs:
 
           INSTANCE_STATE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].State.Name // "N/A"')"
           PLATFORM_DETAILS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PlatformDetails // "N/A"')"
-          PRIVATE_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress // ""')"
-          PRIVATE_DNS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PrivateDnsName // "N/A"')"
+          PRIVATE_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress // "N/A"')"
           PUBLIC_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PublicIpAddress // "N/A"')"
           VPC_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].VpcId // "N/A"')"
           SUBNET_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].SubnetId // "N/A"')"
           INSTANCE_TYPE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].InstanceType // "N/A"')"
           AZ="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Placement.AvailabilityZone // "N/A"')"
-          EBS_COUNT="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].BlockDeviceMappings | length')"
 
-          SECONDARY_IPS="$(echo "$INSTANCE_JSON" | jq -r '[.Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddresses[]? | select(.Primary==false) | .PrivateIpAddress] | join(",")')"
+          SECONDARY_IPS="$(echo "$INSTANCE_JSON" | jq -r '[.Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddresses[]? | select(.Primary==false) | .PrivateIpAddress] | join(", ")')"
           [ -n "${SECONDARY_IPS:-}" ] || SECONDARY_IPS="None"
-
-          SG_IDS="$(echo "$INSTANCE_JSON" | jq -r '[.Reservations[0].Instances[0].SecurityGroups[]?.GroupId] | join(",")')"
-          SG_NAMES="$(echo "$INSTANCE_JSON" | jq -r '[.Reservations[0].Instances[0].SecurityGroups[]?.GroupName] | join(",")')"
-          [ -n "${SG_IDS:-}" ] || SG_IDS="None"
-          [ -n "${SG_NAMES:-}" ] || SG_NAMES="None"
 
           VPC_NAME="$(aws ec2 describe-tags \
             --region "$REGION" \
@@ -147,44 +154,62 @@ jobs:
           RAM_MIB="$(echo "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].MemoryInfo.SizeInMiB // 0')"
           RAM_GB="$(awk "BEGIN {printf \"%.2f\", $RAM_MIB/1024}")"
 
-          HEALTH_JSON="$(aws ec2 describe-instance-status \
-            --region "$REGION" \
-            --instance-ids "$TARGET_INSTANCE_ID" \
-            --include-all-instances \
-            --output json)"
-
-          SYSTEM_STATUS="$(echo "$HEALTH_JSON" | jq -r '.InstanceStatuses[0].SystemStatus.Status // "N/A"')"
-          INSTANCE_STATUS="$(echo "$HEALTH_JSON" | jq -r '.InstanceStatuses[0].InstanceStatus.Status // "N/A"')"
-
           echo
           log "Server attributes"
           echo
-
-          printf "%-20s %-15s %-20s %-15s %-15s %-20s %-20s %-15s %-15s %-10s %-10s %-10s %-12s %-15s %-15s %-30s\n" \
-            "Server Name" "Region" "Instance ID" "Account ID" "AZ" "VPC Name" "Subnet Name" "Private IP" "Public IP" "EBS Cnt" "Type" "vCPUs" "RAM(GB)" "SysHealth" "InstHealth" "Sec. IPs"
-
-          echo "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-
-          printf "%-20s %-15s %-20s %-15s %-15s %-20s %-20s %-15s %-15s %-10s %-10s %-10s %-12s %-15s %-15s %-30s\n" \
-            "$INSTANCE_NAME" "$REGION" "$TARGET_INSTANCE_ID" "$ACCOUNT_ID" "$AZ" "$VPC_NAME" "$SUBNET_NAME" "${PRIVATE_IP:-N/A}" "$PUBLIC_IP" "$EBS_COUNT" "$INSTANCE_TYPE" "$VCPU" "$RAM_GB" "$SYSTEM_STATUS" "$INSTANCE_STATUS" "$SECONDARY_IPS"
+          print_kv_header
+          print_kv_row "Server Name" "$INSTANCE_NAME"
+          print_kv_row "Region" "$REGION"
+          print_kv_row "Instance ID" "$TARGET_INSTANCE_ID"
+          print_kv_row "Account ID" "$ACCOUNT_ID"
+          print_kv_row "Instance State" "$INSTANCE_STATE"
+          print_kv_row "Platform Details" "$PLATFORM_DETAILS"
+          print_kv_row "Availability Zone" "$AZ"
+          print_kv_row "Instance Type" "$INSTANCE_TYPE"
+          print_kv_row "vCPUs" "$VCPU"
+          print_kv_row "RAM (GB)" "$RAM_GB"
+          print_kv_row "Private IP" "$PRIVATE_IP"
+          print_kv_row "Public IP" "$PUBLIC_IP"
+          print_kv_row "Secondary IPs" "$SECONDARY_IPS"
+          print_kv_row "VPC Name" "$VPC_NAME"
+          print_kv_row "VPC ID" "$VPC_ID"
+          print_kv_row "Subnet Name" "$SUBNET_NAME"
+          print_kv_row "Subnet ID" "$SUBNET_ID"
 
           echo
-          echo "Instance State    : $INSTANCE_STATE"
-          echo "Platform Details  : $PLATFORM_DETAILS"
-          echo "Private DNS       : $PRIVATE_DNS"
-          echo "VPC ID            : $VPC_ID"
-          echo "Subnet ID         : $SUBNET_ID"
-          echo "Security Groups   : $SG_NAMES"
-          echo "Security Group IDs: $SG_IDS"
+          log "Security groups attached"
+          echo
+          printf "%-36s | %s\n" "Group Name" "Group ID"
+          printf "%-36s-+-%s\n" "------------------------------------" "----------------------------"
+
+          SG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].SecurityGroups[]? |
+            [.GroupName, .GroupId] | @tsv
+          ')"
+
+          if [ -z "${SG_ROWS:-}" ]; then
+            printf "%-36s | %s\n" "N/A" "No security groups found"
+          else
+            while IFS=$'\t' read -r SG_NAME SG_ID; do
+              [ -n "${SG_NAME:-}" ] || SG_NAME="N/A"
+              [ -n "${SG_ID:-}" ] || SG_ID="N/A"
+              printf "%-36s | %s\n" "$SG_NAME" "$SG_ID"
+            done <<< "$SG_ROWS"
+          fi
 
           echo
-          echo "Device Name     Volume ID            Type       Size(GB)   IOPS       Encrypted"
-          echo "--------------------------------------------------------------------------------"
+          log "EBS volumes"
+          echo
+          printf "%-14s | %-20s | %-8s | %-8s | %-8s | %s\n" "Device Name" "Volume ID" "Type" "SizeGB" "IOPS" "Encrypted"
+          printf "%-14s-+-%-20s-+-%-8s-+-%-8s-+-%-8s-+-%s\n" "--------------" "--------------------" "--------" "--------" "--------" "----------"
 
-          BLOCK_DEVICE_ROWS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].BlockDeviceMappings[]? | [.DeviceName, .Ebs.VolumeId] | @tsv')"
+          BLOCK_DEVICE_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].BlockDeviceMappings[]? |
+            [.DeviceName, .Ebs.VolumeId] | @tsv
+          ')"
 
           if [ -z "${BLOCK_DEVICE_ROWS:-}" ]; then
-            echo "No EBS volumes found."
+            printf "%-14s | %-20s | %-8s | %-8s | %-8s | %s\n" "N/A" "N/A" "N/A" "N/A" "N/A" "No EBS volumes found"
           else
             while IFS=$'\t' read -r DEVICE VOLUME_ID; do
               [ -n "${VOLUME_ID:-}" ] || continue
@@ -199,34 +224,51 @@ jobs:
               VIOPS="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Iops // "N/A"')"
               VENCRYPTED="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Encrypted // "N/A"')"
 
-              printf "%-15s %-20s %-10s %-10s %-10s %-10s\n" \
+              printf "%-14s | %-20s | %-8s | %-8s | %-8s | %s\n" \
                 "$DEVICE" "$VOLUME_ID" "$VTYPE" "$VSIZE" "$VIOPS" "$VENCRYPTED"
             done <<< "$BLOCK_DEVICE_ROWS"
           fi
 
           echo
-          echo "Tag Key                        Tag Value"
-          echo "----------------------------------------------------------"
+          log "Instance tags"
+          echo
+          printf "%-30s | %s\n" "Tag Key" "Tag Value"
+          printf "%-30s-+-%s\n" "------------------------------" "----------------------------------------------------------"
 
-          TAG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Tags[]? | [.Key, .Value] | @tsv')"
+          TAG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].Tags[]? |
+            [.Key, .Value] | @tsv
+          ' | sort)"
 
           if [ -z "${TAG_ROWS:-}" ]; then
-            echo "No tags found."
+            printf "%-30s | %s\n" "N/A" "No tags found"
           else
             while IFS=$'\t' read -r KEY VALUE; do
-              printf "%-30s %-50s\n" "$KEY" "$VALUE"
+              [ -n "${KEY:-}" ] || KEY="N/A"
+              [ -n "${VALUE:-}" ] || VALUE="N/A"
+              printf "%-30s | %s\n" "$KEY" "$VALUE"
             done <<< "$TAG_ROWS"
           fi
 
           echo
-          log "Sending SSM details command..."
+          log "Sending SSM validation command..."
 
-          COMMAND_ID="$(aws ssm send-command \
-            --region "$REGION" \
-            --document-name "$DOCUMENT_NAME" \
-            --instance-ids "$TARGET_INSTANCE_ID" \
-            --query "Command.CommandId" \
-            --output text)"
+          if [ -n "${DNS_NAME_TO_RESOLVE:-}" ]; then
+            COMMAND_ID="$(aws ssm send-command \
+              --region "$REGION" \
+              --document-name "$DOCUMENT_NAME" \
+              --instance-ids "$TARGET_INSTANCE_ID" \
+              --parameters "DnsNameToResolve=$DNS_NAME_TO_RESOLVE" \
+              --query "Command.CommandId" \
+              --output text)"
+          else
+            COMMAND_ID="$(aws ssm send-command \
+              --region "$REGION" \
+              --document-name "$DOCUMENT_NAME" \
+              --instance-ids "$TARGET_INSTANCE_ID" \
+              --query "Command.CommandId" \
+              --output text)"
+          fi
 
           echo "SSM Command ID: $COMMAND_ID"
 
