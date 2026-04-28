@@ -229,7 +229,7 @@ jobs:
           RAM_GB="$(awk "BEGIN {printf \"%.2f\", $RAM_MIB/1024}")"
 
           DISPLAY_LABEL="$INSTANCE_NAME | $TARGET_INSTANCE_ID"
-          REPORT_TITLE="Server post configuration validations | $TARGET_INSTANCE_ID | $INSTANCE_NAME"
+          REPORT_TITLE="Server post configuration validations | $INSTANCE_NAME | $TARGET_INSTANCE_ID"
 
           echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" >> "$GITHUB_ENV"
           echo "INSTANCE_NAME=$INSTANCE_NAME" >> "$GITHUB_ENV"
