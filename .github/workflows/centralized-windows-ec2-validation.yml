@@ -15,10 +15,6 @@ on:
         description: "EC2 instance id"
         required: false
         default: ""
-      dns_name_to_resolve:
-        description: "Hostname for nslookup forward lookup"
-        required: false
-        default: ""
 
 jobs:
   validate:
@@ -38,13 +34,12 @@ jobs:
           aws-region: ${{ inputs.region }}
           role-to-assume: arn:aws:iam::345362761155:role/OIDCRoleForGitHubActions
 
-      - name: Resolve target instance, display EC2 attributes, and run SSM validation
+      - name: 1) Server Attributes
         shell: bash
         env:
           REGION: ${{ inputs.region }}
           SERVER_NAME: ${{ inputs.server_name }}
           INSTANCE_ID: ${{ inputs.instance_id }}
-          DNS_NAME_TO_RESOLVE: ${{ inputs.dns_name_to_resolve }}
         run: |
           set -euo pipefail
 
@@ -62,6 +57,7 @@ jobs:
           }
 
           log "Resolving target instance..."
+          echo
 
           if [ -z "$INSTANCE_ID" ] && [ -z "$SERVER_NAME" ]; then
             echo "Either instance_id or server_name must be provided." >&2
@@ -91,33 +87,24 @@ jobs:
             TARGET_INSTANCE_ID="$1"
           fi
 
-          echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" >> "$GITHUB_ENV"
-
-          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-
-          DOCUMENT_TYPE="$(aws ssm describe-document \
-            --region "$REGION" \
-            --name "$DOCUMENT_NAME" \
-            --query 'Document.DocumentType' \
-            --output text 2>/dev/null || true)"
-
-          if [ -z "${DOCUMENT_TYPE:-}" ] || [ "$DOCUMENT_TYPE" = "None" ]; then
-            echo "SSM document not found: $DOCUMENT_NAME" >&2
-            exit 1
-          fi
-
-          if [ "$DOCUMENT_TYPE" != "Command" ]; then
-            echo "SSM document $DOCUMENT_NAME is type '$DOCUMENT_TYPE', but send-command requires type 'Command'." >&2
-            exit 1
-          fi
-
           INSTANCE_JSON="$(aws ec2 describe-instances \
             --region "$REGION" \
             --instance-ids "$TARGET_INSTANCE_ID" \
             --output json)"
 
           INSTANCE_NAME="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Tags[]? | select(.Key=="Name") | .Value' | head -n1)"
-          [ -n "${INSTANCE_NAME:-}" ] || INSTANCE_NAME="N/A"
+          [ -n "${INSTANCE_NAME:-}" ] && [ "$INSTANCE_NAME" != "null" ] || INSTANCE_NAME="N/A"
+
+          DNS_LOOKUP_NAME="$INSTANCE_NAME"
+          if [ "$DNS_LOOKUP_NAME" = "N/A" ] && [ -n "${SERVER_NAME:-}" ]; then
+            DNS_LOOKUP_NAME="$SERVER_NAME"
+          fi
+
+          echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "INSTANCE_NAME=$INSTANCE_NAME" >> "$GITHUB_ENV"
+          echo "DNS_LOOKUP_NAME=$DNS_LOOKUP_NAME" >> "$GITHUB_ENV"
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
           INSTANCE_STATE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].State.Name // "N/A"')"
           PLATFORM_DETAILS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PlatformDetails // "N/A"')"
@@ -159,6 +146,7 @@ jobs:
           echo
           print_kv_header
           print_kv_row "Server Name" "$INSTANCE_NAME"
+          print_kv_row "DNS Lookup Name" "$DNS_LOOKUP_NAME"
           print_kv_row "Region" "$REGION"
           print_kv_row "Instance ID" "$TARGET_INSTANCE_ID"
           print_kv_row "Account ID" "$ACCOUNT_ID"
@@ -175,8 +163,8 @@ jobs:
           print_kv_row "VPC ID" "$VPC_ID"
           print_kv_row "Subnet Name" "$SUBNET_NAME"
           print_kv_row "Subnet ID" "$SUBNET_ID"
-
           echo
+
           log "Security groups attached"
           echo
           printf "%-36s | %s\n" "Group Name" "Group ID"
@@ -196,8 +184,8 @@ jobs:
               printf "%-36s | %s\n" "$SG_NAME" "$SG_ID"
             done <<< "$SG_ROWS"
           fi
-
           echo
+
           log "EBS volumes"
           echo
           printf "%-14s | %-20s | %-8s | %-8s | %-8s | %s\n" "Device Name" "Volume ID" "Type" "SizeGB" "IOPS" "Encrypted"
@@ -228,8 +216,8 @@ jobs:
                 "$DEVICE" "$VOLUME_ID" "$VTYPE" "$VSIZE" "$VIOPS" "$VENCRYPTED"
             done <<< "$BLOCK_DEVICE_ROWS"
           fi
-
           echo
+
           log "Instance tags"
           echo
           printf "%-30s | %s\n" "Tag Key" "Tag Value"
@@ -249,16 +237,56 @@ jobs:
               printf "%-30s | %s\n" "$KEY" "$VALUE"
             done <<< "$TAG_ROWS"
           fi
-
           echo
-          log "Sending SSM validation command..."
 
-          if [ -n "${DNS_NAME_TO_RESOLVE:-}" ]; then
+      - name: 2) SSM Checks
+        shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+
+          log() {
+            echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
+          }
+
+          print_kv_header() {
+            printf "%-26s | %s\n" "Attribute" "Value"
+            printf "%-26s-+-%s\n" "--------------------------" "--------------------------------------------------------------"
+          }
+
+          print_kv_row() {
+            printf "%-26s | %s\n" "$1" "$2"
+          }
+
+          log "Validating SSM document..."
+          echo
+
+          DOCUMENT_TYPE="$(aws ssm describe-document \
+            --region "$REGION" \
+            --name "$DOCUMENT_NAME" \
+            --query 'Document.DocumentType' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "${DOCUMENT_TYPE:-}" ] || [ "$DOCUMENT_TYPE" = "None" ]; then
+            echo "SSM document not found: $DOCUMENT_NAME" >&2
+            exit 1
+          fi
+
+          if [ "$DOCUMENT_TYPE" != "Command" ]; then
+            echo "SSM document $DOCUMENT_NAME is type '$DOCUMENT_TYPE', but send-command requires type 'Command'." >&2
+            exit 1
+          fi
+
+          log "Sending SSM validation command..."
+          echo
+
+          if [ -n "${DNS_LOOKUP_NAME:-}" ] && [ "$DNS_LOOKUP_NAME" != "N/A" ]; then
             COMMAND_ID="$(aws ssm send-command \
               --region "$REGION" \
               --document-name "$DOCUMENT_NAME" \
               --instance-ids "$TARGET_INSTANCE_ID" \
-              --parameters "DnsNameToResolve=$DNS_NAME_TO_RESOLVE" \
+              --parameters "DnsNameToResolve=$DNS_LOOKUP_NAME" \
               --query "Command.CommandId" \
               --output text)"
           else
@@ -269,8 +297,6 @@ jobs:
               --query "Command.CommandId" \
               --output text)"
           fi
-
-          echo "SSM Command ID: $COMMAND_ID"
 
           ATTEMPT=0
           FINAL_STATUS=""
@@ -307,41 +333,51 @@ jobs:
             esac
           done
 
-          if [ -z "$FINAL_STATUS" ]; then
-            FINAL_STATUS="$(aws ssm get-command-invocation \
-              --region "$REGION" \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$TARGET_INSTANCE_ID" \
-              --query "Status" \
-              --output text 2>/dev/null || echo Unknown)"
-          fi
-
-          echo
-          log "Retrieving SSM invocation details..."
-
-          INVOCATION_JSON="$(aws ssm list-command-invocations \
+          INVOCATION_JSON="$(aws ssm get-command-invocation \
             --region "$REGION" \
             --command-id "$COMMAND_ID" \
-            --details \
+            --instance-id "$TARGET_INSTANCE_ID" \
             --output json)"
 
+          PLUGIN_NAME="$(echo "$INVOCATION_JSON" | jq -r '.PluginName // "N/A"')"
+          RESPONSE_CODE="$(echo "$INVOCATION_JSON" | jq -r '.ResponseCode // "N/A"')"
+          STATUS_DETAILS="$(echo "$INVOCATION_JSON" | jq -r '.StatusDetails // "N/A"')"
+          STANDARD_OUTPUT="$(echo "$INVOCATION_JSON" | jq -r '.StandardOutputContent // ""' | tr -d '\r')"
+          STANDARD_ERROR="$(echo "$INVOCATION_JSON" | jq -r '.StandardErrorContent // ""' | tr -d '\r')"
+
           echo
-          log "SSM plugin details"
+          log "SSM checks"
+          echo
+          print_kv_header
+          print_kv_row "Document Name" "$DOCUMENT_NAME"
+          print_kv_row "Target Instance ID" "$TARGET_INSTANCE_ID"
+          print_kv_row "Server Name" "${INSTANCE_NAME:-N/A}"
+          print_kv_row "DNS Lookup Name" "${DNS_LOOKUP_NAME:-N/A}"
+          print_kv_row "Command ID" "$COMMAND_ID"
+          print_kv_row "Plugin Name" "$PLUGIN_NAME"
+          print_kv_row "Status" "${FINAL_STATUS:-$STATUS_DETAILS}"
+          print_kv_row "Response Code" "$RESPONSE_CODE"
+          echo
 
-          echo "$INVOCATION_JSON" | jq -r '
-            .CommandInvocations[0].CommandPlugins[]? |
-            "Plugin: " + (.Name // "N/A") + "\n" +
-            "Status: " + (.Status // "N/A") + "\n" +
-            "ResponseCode: " + ((.ResponseCode // "N/A") | tostring) + "\n" +
-            "----- Output -----\n" +
-            (.Output // "(no output)") + "\n" +
-            "------------------"
-          '
+          log "SSM document output"
+          echo
+          if [ -n "${STANDARD_OUTPUT:-}" ]; then
+            printf "%s\n" "$STANDARD_OUTPUT"
+          else
+            echo "(no output)"
+          fi
+          echo
 
-          if [ "$FINAL_STATUS" != "Success" ]; then
-            echo "SSM details collection failed with status: $FINAL_STATUS" >&2
+          if [ -n "${STANDARD_ERROR:-}" ]; then
+            log "SSM standard error"
+            echo
+            printf "%s\n" "$STANDARD_ERROR"
+            echo
+          fi
+
+          if [ "${FINAL_STATUS:-Unknown}" != "Success" ]; then
+            echo "SSM details collection failed with status: ${FINAL_STATUS:-Unknown}" >&2
             exit 1
           fi
 
-          echo
           log "Workflow completed successfully"
