@@ -49,15 +49,18 @@ jobs:
 
           print_kv_header() {
             printf "%-26s | %s\n" "Attribute" "Value"
-            printf "%-26s-+-%s\n" "--------------------------" "--------------------------------------------------------------"
+            printf "%-26s-+-%s\n" "--------------------------" "---------------------------------------------------------------"
           }
 
           print_kv_row() {
             printf "%-26s | %s\n" "$1" "$2"
           }
 
+          print_section_gap() {
+            printf "\n"
+          }
+
           log "Resolving target instance..."
-          echo
 
           if [ -z "$INSTANCE_ID" ] && [ -z "$SERVER_NAME" ]; then
             echo "Either instance_id or server_name must be provided." >&2
@@ -105,7 +108,6 @@ jobs:
           echo "DNS_LOOKUP_NAME=$DNS_LOOKUP_NAME" >> "$GITHUB_ENV"
 
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-
           INSTANCE_STATE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].State.Name // "N/A"')"
           PLATFORM_DETAILS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PlatformDetails // "N/A"')"
           PRIVATE_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress // "N/A"')"
@@ -141,9 +143,7 @@ jobs:
           RAM_MIB="$(echo "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].MemoryInfo.SizeInMiB // 0')"
           RAM_GB="$(awk "BEGIN {printf \"%.2f\", $RAM_MIB/1024}")"
 
-          echo
           log "Server attributes"
-          echo
           print_kv_header
           print_kv_row "Server Name" "$INSTANCE_NAME"
           print_kv_row "DNS Lookup Name" "$DNS_LOOKUP_NAME"
@@ -163,12 +163,11 @@ jobs:
           print_kv_row "VPC ID" "$VPC_ID"
           print_kv_row "Subnet Name" "$SUBNET_NAME"
           print_kv_row "Subnet ID" "$SUBNET_ID"
-          echo
 
+          print_section_gap
           log "Security groups attached"
-          echo
           printf "%-36s | %s\n" "Group Name" "Group ID"
-          printf "%-36s-+-%s\n" "------------------------------------" "----------------------------"
+          printf "%-36s-+-%s\n" "------------------------------------" "-----------------------------"
 
           SG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
             .Reservations[0].Instances[0].SecurityGroups[]? |
@@ -184,12 +183,11 @@ jobs:
               printf "%-36s | %s\n" "$SG_NAME" "$SG_ID"
             done <<< "$SG_ROWS"
           fi
-          echo
 
+          print_section_gap
           log "EBS volumes"
-          echo
-          printf "%-14s | %-20s | %-8s | %-8s | %-8s | %s\n" "Device Name" "Volume ID" "Type" "SizeGB" "IOPS" "Encrypted"
-          printf "%-14s-+-%-20s-+-%-8s-+-%-8s-+-%-8s-+-%s\n" "--------------" "--------------------" "--------" "--------" "--------" "----------"
+          printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" "Device Name" "Volume ID" "Type" "SizeGB" "IOPS" "Encrypted"
+          printf "%-14s-+-%-21s-+-%-8s-+-%-8s-+-%-8s-+-%s\n" "--------------" "---------------------" "--------" "--------" "--------" "-----------"
 
           BLOCK_DEVICE_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
             .Reservations[0].Instances[0].BlockDeviceMappings[]? |
@@ -197,7 +195,7 @@ jobs:
           ')"
 
           if [ -z "${BLOCK_DEVICE_ROWS:-}" ]; then
-            printf "%-14s | %-20s | %-8s | %-8s | %-8s | %s\n" "N/A" "N/A" "N/A" "N/A" "N/A" "No EBS volumes found"
+            printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" "N/A" "N/A" "N/A" "N/A" "N/A" "No EBS volumes found"
           else
             while IFS=$'\t' read -r DEVICE VOLUME_ID; do
               [ -n "${VOLUME_ID:-}" ] || continue
@@ -212,16 +210,15 @@ jobs:
               VIOPS="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Iops // "N/A"')"
               VENCRYPTED="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Encrypted // "N/A"')"
 
-              printf "%-14s | %-20s | %-8s | %-8s | %-8s | %s\n" \
+              printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" \
                 "$DEVICE" "$VOLUME_ID" "$VTYPE" "$VSIZE" "$VIOPS" "$VENCRYPTED"
             done <<< "$BLOCK_DEVICE_ROWS"
           fi
-          echo
 
+          print_section_gap
           log "Instance tags"
-          echo
           printf "%-30s | %s\n" "Tag Key" "Tag Value"
-          printf "%-30s-+-%s\n" "------------------------------" "----------------------------------------------------------"
+          printf "%-30s-+-%s\n" "------------------------------" "-----------------------------------------------------------"
 
           TAG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
             .Reservations[0].Instances[0].Tags[]? |
@@ -236,8 +233,7 @@ jobs:
               [ -n "${VALUE:-}" ] || VALUE="N/A"
               printf "%-30s | %s\n" "$KEY" "$VALUE"
             done <<< "$TAG_ROWS"
-          fi
-          echo
+          done
 
       - name: 2) SSM Checks
         shell: bash
@@ -252,15 +248,18 @@ jobs:
 
           print_kv_header() {
             printf "%-26s | %s\n" "Attribute" "Value"
-            printf "%-26s-+-%s\n" "--------------------------" "--------------------------------------------------------------"
+            printf "%-26s-+-%s\n" "--------------------------" "---------------------------------------------------------------"
           }
 
           print_kv_row() {
             printf "%-26s | %s\n" "$1" "$2"
           }
 
+          print_section_gap() {
+            printf "\n"
+          }
+
           log "Validating SSM document..."
-          echo
 
           DOCUMENT_TYPE="$(aws ssm describe-document \
             --region "$REGION" \
@@ -279,7 +278,6 @@ jobs:
           fi
 
           log "Sending SSM validation command..."
-          echo
 
           if [ -n "${DNS_LOOKUP_NAME:-}" ] && [ "$DNS_LOOKUP_NAME" != "N/A" ]; then
             COMMAND_ID="$(aws ssm send-command \
@@ -303,7 +301,6 @@ jobs:
 
           while [ "$ATTEMPT" -lt 30 ]; do
             ATTEMPT=$((ATTEMPT + 1))
-
             STATUS="$(aws ssm get-command-invocation \
               --region "$REGION" \
               --command-id "$COMMAND_ID" \
@@ -345,9 +342,7 @@ jobs:
           STANDARD_OUTPUT="$(echo "$INVOCATION_JSON" | jq -r '.StandardOutputContent // ""' | tr -d '\r')"
           STANDARD_ERROR="$(echo "$INVOCATION_JSON" | jq -r '.StandardErrorContent // ""' | tr -d '\r')"
 
-          echo
           log "SSM checks"
-          echo
           print_kv_header
           print_kv_row "Document Name" "$DOCUMENT_NAME"
           print_kv_row "Target Instance ID" "$TARGET_INSTANCE_ID"
@@ -357,22 +352,15 @@ jobs:
           print_kv_row "Plugin Name" "$PLUGIN_NAME"
           print_kv_row "Status" "${FINAL_STATUS:-$STATUS_DETAILS}"
           print_kv_row "Response Code" "$RESPONSE_CODE"
-          echo
 
+          print_section_gap
           log "SSM document output"
-          echo
-          if [ -n "${STANDARD_OUTPUT:-}" ]; then
-            printf "%s\n" "$STANDARD_OUTPUT"
-          else
-            echo "(no output)"
-          fi
-          echo
+          printf "%s\n" "${STANDARD_OUTPUT:-"(no output)"}"
 
           if [ -n "${STANDARD_ERROR:-}" ]; then
+            print_section_gap
             log "SSM standard error"
-            echo
             printf "%s\n" "$STANDARD_ERROR"
-            echo
           fi
 
           if [ "${FINAL_STATUS:-Unknown}" != "Success" ]; then
@@ -380,4 +368,5 @@ jobs:
             exit 1
           fi
 
+          print_section_gap
           log "Workflow completed successfully"
