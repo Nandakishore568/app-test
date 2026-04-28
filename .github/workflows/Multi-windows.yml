@@ -1,4 +1,4 @@
-name: Centralized Multi Windows EC2 Validation
+name: Centralized Windows EC2 Validation
 
 on:
   workflow_dispatch:
@@ -235,6 +235,13 @@ jobs:
           echo "AMI_ID=$AMI_ID" >> "$GITHUB_ENV"
           echo "AMI_NAME=$AMI_NAME" >> "$GITHUB_ENV"
 
+          printf "\n########################################################################\n"
+          printf "SERVER REPORT | %s\n" "$DISPLAY_LABEL"
+          printf "########################################################################\n"
+          printf "%-18s | %s\n" "Generated UTC" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          printf "%-18s | %s\n" "Target Input" "$TARGET_INPUT"
+          printf "%-18s | %s\n\n" "Region" "$REGION"
+
           section_banner "SERVER ATTRIBUTES | $DISPLAY_LABEL"
           print_kv_header
           print_kv_row "Server Name" "$INSTANCE_NAME"
@@ -436,11 +443,9 @@ jobs:
             --instance-id "$TARGET_INSTANCE_ID" \
             --output json)"
 
-          PLUGIN_NAME="$(echo "$INVOCATION_JSON" | jq -r '.PluginName // "N/A"')"
-          RESPONSE_CODE="$(echo "$INVOCATION_JSON" | jq -r '.ResponseCode // "N/A"')"
-          STATUS_DETAILS="$(echo "$INVOCATION_JSON" | jq -r '.StatusDetails // "N/A"')"
           STANDARD_OUTPUT="$(echo "$INVOCATION_JSON" | jq -r '.StandardOutputContent // ""' | tr -d '\r')"
           STANDARD_ERROR="$(echo "$INVOCATION_JSON" | jq -r '.StandardErrorContent // ""' | tr -d '\r')"
+          STATUS_DETAILS="$(echo "$INVOCATION_JSON" | jq -r '.StatusDetails // "N/A"')"
 
           EFFECTIVE_STATUS="${FINAL_STATUS:-$STATUS_DETAILS}"
 
@@ -449,13 +454,7 @@ jobs:
 
           section_banner "SSM CHECKS | $DISPLAY_LABEL"
           print_kv_header
-          print_kv_row "Document Name" "$DOCUMENT_NAME"
-          print_kv_row "Target Instance ID" "$TARGET_INSTANCE_ID"
-          print_kv_row "Server Name" "${INSTANCE_NAME:-N/A}"
           print_kv_row "Command ID" "$COMMAND_ID"
-          print_kv_row "Plugin Name" "$PLUGIN_NAME"
-          print_kv_row "Status" "$EFFECTIVE_STATUS"
-          print_kv_row "Response Code" "$RESPONSE_CODE"
 
           print_section_gap
           section_banner "SSM DOCUMENT OUTPUT | $DISPLAY_LABEL"
@@ -478,8 +477,6 @@ jobs:
       - name: 3) Create review files
         if: ${{ always() }}
         shell: bash
-        env:
-          INPUT_REGION: ${{ inputs.region }}
         run: |
           set -euo pipefail
 
@@ -487,38 +484,131 @@ jobs:
           import csv
           import os
 
+          report_file = os.environ["REPORT_FILE"]
           summary_csv = os.environ["SUMMARY_CSV"]
 
-          headers = [
-              "Target Input",
-              "Server Name",
-              "Instance ID",
-              "AMI ID",
-              "AMI Name",
-              "Region",
-              "Account ID",
-              "Instance State",
-              "SSM Status",
-              "Command ID",
-          ]
+          with open(report_file, encoding="utf-8") as f:
+              lines = [line.rstrip("\n") for line in f]
 
-          row = [
-              os.environ.get("SAFE_TARGET", ""),
-              os.environ.get("INSTANCE_NAME", "N/A"),
-              os.environ.get("TARGET_INSTANCE_ID", "N/A"),
-              os.environ.get("AMI_ID", "N/A"),
-              os.environ.get("AMI_NAME", "N/A"),
-              os.environ.get("INPUT_REGION", "N/A"),
-              os.environ.get("ACCOUNT_ID", "N/A"),
-              os.environ.get("INSTANCE_STATE", "N/A"),
-              os.environ.get("SSM_FINAL_STATUS", "N/A"),
-              os.environ.get("COMMAND_ID", "N/A"),
-          ]
+          report_title = ""
+          server_name = os.environ.get("INSTANCE_NAME", "N/A")
+          instance_id = os.environ.get("TARGET_INSTANCE_ID", "N/A")
+
+          for line in lines:
+              stripped = line.strip()
+              if stripped.startswith("SERVER REPORT | "):
+                  report_title = stripped
+                  parts = [p.strip() for p in stripped.split("|")]
+                  if len(parts) >= 3:
+                      server_name = parts[1]
+                      instance_id = parts[2]
+                  break
+
+          rows = []
+          current_section = ""
+          current_headers = None
+          line_counter = 0
+
+          def is_equals_line(s):
+              s = s.strip()
+              return bool(s) and set(s) == {"="}
+
+          def is_dash_cell(cell):
+              c = cell.strip()
+              return bool(c) and set(c) == {"-"}
+
+          def is_separator_row(parts):
+              non_empty = [p for p in parts if p.strip()]
+              return bool(non_empty) and all(is_dash_cell(p) for p in non_empty)
+
+          def add_row(section, item, value):
+              rows.append([
+                  report_title or f"SERVER REPORT | {server_name} | {instance_id}",
+                  server_name,
+                  instance_id,
+                  section,
+                  item,
+                  value,
+              ])
+
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+
+              if not stripped:
+                  continue
+
+              if stripped.startswith("[") and "]" in stripped:
+                  continue
+
+              if (
+                  i > 0 and i < len(lines) - 1 and
+                  is_equals_line(lines[i - 1]) and
+                  is_equals_line(lines[i + 1])
+              ):
+                  current_section = stripped
+                  current_headers = None
+                  line_counter = 0
+                  continue
+
+              if stripped.startswith("SERVER REPORT | "):
+                  continue
+
+              if stripped.startswith("Generated UTC") or stripped.startswith("Target Input") or stripped.startswith("Region"):
+                  parts = [p.strip() for p in line.split("|", 1)]
+                  if len(parts) == 2:
+                      add_row("REPORT CONTEXT", parts[0], parts[1])
+                  continue
+
+              if not current_section:
+                  continue
+
+              if current_section.startswith("SSM DOCUMENT OUTPUT |") or current_section.startswith("SSM STANDARD ERROR |"):
+                  line_counter += 1
+                  add_row(current_section, f"Line {line_counter}", stripped)
+                  continue
+
+              if "|" in line:
+                  parts = [p.strip() for p in line.split("|")]
+
+                  if is_separator_row(parts):
+                      continue
+
+                  if current_headers is None:
+                      current_headers = parts
+                      continue
+
+                  if len(parts) == 2:
+                      add_row(current_section, parts[0], parts[1])
+                  elif len(parts) > 2:
+                      item = parts[0]
+                      detail_pairs = []
+                      upper = min(len(parts), len(current_headers))
+                      for idx in range(1, upper):
+                          detail_pairs.append(f"{current_headers[idx]}={parts[idx]}")
+                      add_row(current_section, item, "; ".join(detail_pairs))
+                  continue
+
+          if not rows:
+              rows.append([
+                  report_title or f"SERVER REPORT | {server_name} | {instance_id}",
+                  server_name,
+                  instance_id,
+                  "REPORT",
+                  "Status",
+                  "No parsed data found",
+              ])
 
           with open(summary_csv, "w", newline="", encoding="utf-8") as f:
               writer = csv.writer(f)
-              writer.writerow(headers)
-              writer.writerow(row)
+              writer.writerow([
+                  "Report Title",
+                  "Server Name",
+                  "Instance ID",
+                  "Section",
+                  "Item",
+                  "Value",
+              ])
+              writer.writerows(rows)
           PY
 
       - name: Upload per-server artifacts
@@ -532,7 +622,9 @@ jobs:
 
   consolidate-review-pack:
     if: ${{ always() }}
-    needs: validate
+    needs:
+      - prepare-targets
+      - validate
     runs-on: ubuntu-latest
 
     steps:
@@ -580,16 +672,12 @@ jobs:
 
           if headers is None:
               headers = [
-                  "Target Input",
+                  "Report Title",
                   "Server Name",
                   "Instance ID",
-                  "AMI ID",
-                  "AMI Name",
-                  "Region",
-                  "Account ID",
-                  "Instance State",
-                  "SSM Status",
-                  "Command ID",
+                  "Section",
+                  "Item",
+                  "Value",
               ]
 
           with open(combined_csv, "w", newline="", encoding="utf-8") as f:
@@ -602,17 +690,35 @@ jobs:
                   out.write("No server reports were found.\n")
               else:
                   for idx, file in enumerate(txt_files, start=1):
+                      if idx > 1:
+                          out.write("\n")
                       out.write("=" * 95 + "\n")
-                      out.write(f"REPORT {idx}: {os.path.basename(file)}\n")
+                      out.write(f"COMBINED REPORT ENTRY {idx}\n")
                       out.write("=" * 95 + "\n\n")
                       with open(file, encoding="utf-8") as src:
-                          out.write(src.read().rstrip() + "\n\n")
+                          out.write(src.read().rstrip() + "\n")
           PY
+
+      - name: Build artifact name
+        id: artifact_meta
+        shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+          TARGET_COUNT: ${{ needs.prepare-targets.outputs.count }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          TIMESTAMP_UTC="$(date -u +'%Y%m%dT%H%M%SZ')"
+          ARTIFACT_NAME="ec2-validation_${REGION}_${TIMESTAMP_UTC}_${TARGET_COUNT}targets_run${RUN_NUMBER}_try${RUN_ATTEMPT}"
+
+          echo "timestamp_utc=$TIMESTAMP_UTC" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload combined review pack
         uses: actions/upload-artifact@v4
         with:
-          name: ec2-validation-review-pack
+          name: ${{ steps.artifact_meta.outputs.artifact_name }}
           path: |
             review-pack/combined-summary.csv
             review-pack/combined-reports.txt
