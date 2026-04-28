@@ -1,4 +1,4 @@
-name: Centralized-Windows-EC2-Validation
+name: Centralized Windows EC2 Validation
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
           aws-region: ${{ inputs.region }}
           role-to-assume: arn:aws:iam::345362761155:role/OIDCRoleForGitHubActions
 
-      - name: Resolve target instance, display EC2 attributes, and run SSM details
+      - name: Resolve target instance, display EC2 attributes, and run SSM validation
         shell: bash
         env:
           REGION: ${{ inputs.region }}
@@ -80,6 +80,22 @@ jobs:
           echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" >> "$GITHUB_ENV"
 
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+
+          DOCUMENT_TYPE="$(aws ssm describe-document \
+            --region "$REGION" \
+            --name "$DOCUMENT_NAME" \
+            --query 'Document.DocumentType' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "${DOCUMENT_TYPE:-}" ] || [ "$DOCUMENT_TYPE" = "None" ]; then
+            echo "SSM document not found: $DOCUMENT_NAME" >&2
+            exit 1
+          fi
+
+          if [ "$DOCUMENT_TYPE" != "Command" ]; then
+            echo "SSM document $DOCUMENT_NAME is type '$DOCUMENT_TYPE', but send-command requires type 'Command'." >&2
+            exit 1
+          fi
 
           INSTANCE_JSON="$(aws ec2 describe-instances \
             --region "$REGION" \
@@ -279,32 +295,6 @@ jobs:
             (.Output // "(no output)") + "\n" +
             "------------------"
           '
-
-          STDOUT_CONTENT="$(aws ssm get-command-invocation \
-            --region "$REGION" \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$TARGET_INSTANCE_ID" \
-            --query "StandardOutputContent" \
-            --output text 2>/dev/null || true)"
-
-          STDERR_CONTENT="$(aws ssm get-command-invocation \
-            --region "$REGION" \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$TARGET_INSTANCE_ID" \
-            --query "StandardErrorContent" \
-            --output text 2>/dev/null || true)"
-
-          if [ -n "${STDOUT_CONTENT:-}" ] && [ "$STDOUT_CONTENT" != "None" ]; then
-            echo
-            log "Top-level stdout"
-            printf "%b\n" "$STDOUT_CONTENT"
-          fi
-
-          if [ -n "${STDERR_CONTENT:-}" ] && [ "$STDERR_CONTENT" != "None" ]; then
-            echo
-            log "Top-level stderr"
-            printf "%b\n" "$STDERR_CONTENT" >&2
-          fi
 
           if [ "$FINAL_STATUS" != "Success" ]; then
             echo "SSM details collection failed with status: $FINAL_STATUS" >&2
