@@ -116,6 +116,17 @@ jobs:
           SUBNET_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].SubnetId // "N/A"')"
           INSTANCE_TYPE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].InstanceType // "N/A"')"
           AZ="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Placement.AvailabilityZone // "N/A"')"
+          AMI_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].ImageId // "N/A"')"
+
+          AMI_NAME="(AMI name unavailable)"
+          if [ -n "${AMI_ID:-}" ] && [ "$AMI_ID" != "N/A" ]; then
+            AMI_NAME="$(aws ec2 describe-images \
+              --region "$REGION" \
+              --image-ids "$AMI_ID" \
+              --query "Images[0].Name" \
+              --output text 2>/dev/null || true)"
+            [ -n "${AMI_NAME:-}" ] && [ "$AMI_NAME" != "None" ] || AMI_NAME="(AMI name unavailable)"
+          fi
 
           SECONDARY_IPS="$(echo "$INSTANCE_JSON" | jq -r '[.Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddresses[]? | select(.Primary==false) | .PrivateIpAddress] | join(", ")')"
           [ -n "${SECONDARY_IPS:-}" ] || SECONDARY_IPS="None"
@@ -146,9 +157,10 @@ jobs:
           log "Server attributes"
           print_kv_header
           print_kv_row "Server Name" "$INSTANCE_NAME"
-          print_kv_row "DNS Lookup Name" "$DNS_LOOKUP_NAME"
           print_kv_row "Region" "$REGION"
           print_kv_row "Instance ID" "$TARGET_INSTANCE_ID"
+          print_kv_row "AMI ID" "$AMI_ID"
+          print_kv_row "AMI Name" "$AMI_NAME"
           print_kv_row "Account ID" "$ACCOUNT_ID"
           print_kv_row "Instance State" "$INSTANCE_STATE"
           print_kv_row "Platform Details" "$PLATFORM_DETAILS"
@@ -165,6 +177,7 @@ jobs:
           print_kv_row "Subnet ID" "$SUBNET_ID"
 
           print_section_gap
+
           log "Security groups attached"
           printf "%-36s | %s\n" "Group Name" "Group ID"
           printf "%-36s-+-%s\n" "------------------------------------" "-----------------------------"
@@ -185,6 +198,7 @@ jobs:
           fi
 
           print_section_gap
+
           log "EBS volumes"
           printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" "Device Name" "Volume ID" "Type" "SizeGB" "IOPS" "Encrypted"
           printf "%-14s-+-%-21s-+-%-8s-+-%-8s-+-%-8s-+-%s\n" "--------------" "---------------------" "--------" "--------" "--------" "-----------"
@@ -216,6 +230,7 @@ jobs:
           fi
 
           print_section_gap
+
           log "Instance tags"
           printf "%-30s | %s\n" "Tag Key" "Tag Value"
           printf "%-30s-+-%s\n" "------------------------------" "-----------------------------------------------------------"
@@ -347,7 +362,6 @@ jobs:
           print_kv_row "Document Name" "$DOCUMENT_NAME"
           print_kv_row "Target Instance ID" "$TARGET_INSTANCE_ID"
           print_kv_row "Server Name" "${INSTANCE_NAME:-N/A}"
-          print_kv_row "DNS Lookup Name" "${DNS_LOOKUP_NAME:-N/A}"
           print_kv_row "Command ID" "$COMMAND_ID"
           print_kv_row "Plugin Name" "$PLUGIN_NAME"
           print_kv_row "Status" "${FINAL_STATUS:-$STATUS_DETAILS}"
