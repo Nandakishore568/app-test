@@ -1,0 +1,548 @@
+name: Centralized Multi Linux EC2 Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "AWS region"
+        required: true
+        default: "us-west-2"
+      targets:
+        description: "One or more EC2 Name tags and/or instance IDs (comma-separated or new lines)"
+        required: true
+        default: ""
+
+jobs:
+  prepare-targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
+
+    steps:
+      - name: Build target list
+        id: build
+        shell: bash
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TARGETS// }" ]; then
+            echo "Provide at least one target in targets." >&2
+            exit 1
+          fi
+
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import re
+
+          targets = os.getenv("TARGETS", "").strip()
+          items = [x.strip() for x in re.split(r"[\n,]+", targets) if x.strip()]
+
+          deduped = []
+          seen = set()
+
+          for item in items:
+              if item not in seen:
+                  seen.add(item)
+                  deduped.append(item)
+
+          print(f"matrix={json.dumps(deduped)}")
+          print(f"count={len(deduped)}")
+          PY
+
+  validate:
+    name: validate (${{ matrix.target }})
+    needs: prepare-targets
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        target: ${{ fromJson(needs.prepare-targets.outputs.matrix) }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      DOCUMENT_NAME: "Centralized-Linux-EC2-Validation"
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.region }}
+          role-to-assume: arn:aws:iam::345362761155:role/OIDCRoleForGitHubActions
+
+      - name: Initialize report context
+        shell: bash
+        env:
+          TARGET_INPUT: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          REPORT_DIR="$RUNNER_TEMP/ec2-validation-reports"
+          mkdir -p "$REPORT_DIR"
+
+          SAFE_TARGET="$(echo "$TARGET_INPUT" | sed 's/[^[:alnum:]._-]/_/g')"
+          REPORT_FILE="$REPORT_DIR/${SAFE_TARGET}.txt"
+
+          : > "$REPORT_FILE"
+
+          echo "SAFE_TARGET=$SAFE_TARGET" >> "$GITHUB_ENV"
+          echo "REPORT_DIR=$REPORT_DIR" >> "$GITHUB_ENV"
+          echo "REPORT_FILE=$REPORT_FILE" >> "$GITHUB_ENV"
+
+      - name: 1) Server Attributes
+        shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+          TARGET_INPUT: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$REPORT_FILE") 2>&1
+
+          log() {
+            echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
+          }
+
+          section_banner() {
+            printf "\n=======================================================================\n"
+            printf "%s\n" "$1"
+            printf "=======================================================================\n"
+          }
+
+          report_title_banner() {
+            printf "=======================================================================\n"
+            printf "%s\n" "$1"
+            printf "=======================================================================\n\n"
+          }
+
+          print_kv_header() {
+            printf "%-26s | %s\n" "Attribute" "Value"
+            printf "%-26s-+-%s\n" "--------------------------" "---------------------------------------------------------------"
+          }
+
+          print_kv_row() {
+            printf "%-26s | %s\n" "$1" "$2"
+          }
+
+          print_section_gap() {
+            printf "\n"
+          }
+
+          log "Resolving target instance for input: $TARGET_INPUT"
+
+          SERVER_NAME=""
+          INSTANCE_ID=""
+
+          if [[ "$TARGET_INPUT" =~ ^i-[A-Za-z0-9]+$ ]]; then
+            INSTANCE_ID="$TARGET_INPUT"
+          else
+            SERVER_NAME="$TARGET_INPUT"
+          fi
+
+          if [ -n "$INSTANCE_ID" ]; then
+            TARGET_INSTANCE_ID="$INSTANCE_ID"
+          else
+            IDS="$(aws ec2 describe-instances \
+              --region "$REGION" \
+              --filters "Name=tag:Name,Values=$SERVER_NAME" "Name=instance-state-name,Values=running" \
+              --query "Reservations[].Instances[].InstanceId" \
+              --output text)"
+
+            if [ -z "$IDS" ] || [ "$IDS" = "None" ]; then
+              echo "No running instance found for server_name=$SERVER_NAME" >&2
+              exit 1
+            fi
+
+            set -- $IDS
+            if [ "$#" -gt 1 ]; then
+              echo "Multiple running instances found for server_name=$SERVER_NAME. Use instance_id." >&2
+              exit 1
+            fi
+
+            TARGET_INSTANCE_ID="$1"
+          fi
+
+          INSTANCE_JSON="$(aws ec2 describe-instances \
+            --region "$REGION" \
+            --instance-ids "$TARGET_INSTANCE_ID" \
+            --output json)"
+
+          INSTANCE_NAME="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Tags[]? | select(.Key=="Name") | .Value' | head -n1)"
+          [ -n "${INSTANCE_NAME:-}" ] && [ "$INSTANCE_NAME" != "null" ] || INSTANCE_NAME="N/A"
+
+          DNS_LOOKUP_NAME="$INSTANCE_NAME"
+          if [ "$DNS_LOOKUP_NAME" = "N/A" ] && [ -n "${SERVER_NAME:-}" ]; then
+            DNS_LOOKUP_NAME="$SERVER_NAME"
+          fi
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          INSTANCE_STATE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].State.Name // "N/A"')"
+          PLATFORM_DETAILS="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PlatformDetails // "N/A"')"
+          PRIVATE_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress // "N/A"')"
+          PUBLIC_IP="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].PublicIpAddress // "N/A"')"
+          VPC_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].VpcId // "N/A"')"
+          SUBNET_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].SubnetId // "N/A"')"
+          INSTANCE_TYPE="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].InstanceType // "N/A"')"
+          AZ="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].Placement.AvailabilityZone // "N/A"')"
+          AMI_ID="$(echo "$INSTANCE_JSON" | jq -r '.Reservations[0].Instances[0].ImageId // "N/A"')"
+
+          AMI_NAME="(AMI name unavailable)"
+          if [ -n "${AMI_ID:-}" ] && [ "$AMI_ID" != "N/A" ]; then
+            AMI_NAME="$(aws ec2 describe-images \
+              --region "$REGION" \
+              --image-ids "$AMI_ID" \
+              --query "Images[0].Name" \
+              --output text 2>/dev/null || true)"
+            [ -n "${AMI_NAME:-}" ] && [ "$AMI_NAME" != "None" ] || AMI_NAME="(AMI name unavailable)"
+          fi
+
+          SECONDARY_IPS="$(echo "$INSTANCE_JSON" | jq -r '[.Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddresses[]? | select(.Primary==false) | .PrivateIpAddress] | join(", ")')"
+          [ -n "${SECONDARY_IPS:-}" ] || SECONDARY_IPS="None"
+
+          VPC_NAME="$(aws ec2 describe-tags \
+            --region "$REGION" \
+            --filters "Name=resource-id,Values=$VPC_ID" "Name=key,Values=Name" \
+            --query "Tags[0].Value" \
+            --output text 2>/dev/null || true)"
+          [ -n "${VPC_NAME:-}" ] && [ "$VPC_NAME" != "None" ] || VPC_NAME="(No Name tag)"
+
+          SUBNET_NAME="$(aws ec2 describe-tags \
+            --region "$REGION" \
+            --filters "Name=resource-id,Values=$SUBNET_ID" "Name=key,Values=Name" \
+            --query "Tags[0].Value" \
+            --output text 2>/dev/null || true)"
+          [ -n "${SUBNET_NAME:-}" ] && [ "$SUBNET_NAME" != "None" ] || SUBNET_NAME="(No Name tag)"
+
+          INSTANCE_TYPE_JSON="$(aws ec2 describe-instance-types \
+            --region "$REGION" \
+            --instance-types "$INSTANCE_TYPE" \
+            --output json)"
+
+          VCPU="$(echo "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].VCpuInfo.DefaultVCpus // "N/A"')"
+          RAM_MIB="$(echo "$INSTANCE_TYPE_JSON" | jq -r '.InstanceTypes[0].MemoryInfo.SizeInMiB // 0')"
+          RAM_GB="$(awk "BEGIN {printf \"%.2f\", $RAM_MIB/1024}")"
+
+          DISPLAY_LABEL="$INSTANCE_NAME | $TARGET_INSTANCE_ID"
+          REPORT_TITLE="Server post configuration validations | $INSTANCE_NAME | $TARGET_INSTANCE_ID"
+
+          echo "TARGET_INSTANCE_ID=$TARGET_INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "INSTANCE_NAME=$INSTANCE_NAME" >> "$GITHUB_ENV"
+          echo "DNS_LOOKUP_NAME=$DNS_LOOKUP_NAME" >> "$GITHUB_ENV"
+          echo "DISPLAY_LABEL=$DISPLAY_LABEL" >> "$GITHUB_ENV"
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "INSTANCE_STATE=$INSTANCE_STATE" >> "$GITHUB_ENV"
+          echo "AMI_ID=$AMI_ID" >> "$GITHUB_ENV"
+          echo "AMI_NAME=$AMI_NAME" >> "$GITHUB_ENV"
+
+          report_title_banner "$REPORT_TITLE"
+
+          section_banner "SERVER ATTRIBUTES | $DISPLAY_LABEL"
+          print_kv_header
+          print_kv_row "Server Name" "$INSTANCE_NAME"
+          print_kv_row "Region" "$REGION"
+          print_kv_row "Instance ID" "$TARGET_INSTANCE_ID"
+          print_kv_row "AMI ID" "$AMI_ID"
+          print_kv_row "AMI Name" "$AMI_NAME"
+          print_kv_row "Account ID" "$ACCOUNT_ID"
+          print_kv_row "Instance State" "$INSTANCE_STATE"
+          print_kv_row "Platform Details" "$PLATFORM_DETAILS"
+          print_kv_row "Availability Zone" "$AZ"
+          print_kv_row "Instance Type" "$INSTANCE_TYPE"
+          print_kv_row "vCPUs" "$VCPU"
+          print_kv_row "RAM (GB)" "$RAM_GB"
+          print_kv_row "Private IP" "$PRIVATE_IP"
+          print_kv_row "Public IP" "$PUBLIC_IP"
+          print_kv_row "Secondary IPs" "$SECONDARY_IPS"
+          print_kv_row "VPC Name" "$VPC_NAME"
+          print_kv_row "VPC ID" "$VPC_ID"
+          print_kv_row "Subnet Name" "$SUBNET_NAME"
+          print_kv_row "Subnet ID" "$SUBNET_ID"
+
+          print_section_gap
+          section_banner "SECURITY GROUPS | $DISPLAY_LABEL"
+          printf "%-36s | %s\n" "Group Name" "Group ID"
+          printf "%-36s-+-%s\n" "------------------------------------" "-----------------------------"
+
+          SG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].SecurityGroups[]? |
+            [.GroupName, .GroupId] | @tsv
+          ')"
+
+          if [ -z "${SG_ROWS:-}" ]; then
+            printf "%-36s | %s\n" "N/A" "No security groups found"
+          else
+            while IFS=$'\t' read -r SG_NAME SG_ID; do
+              [ -n "${SG_NAME:-}" ] || SG_NAME="N/A"
+              [ -n "${SG_ID:-}" ] || SG_ID="N/A"
+              printf "%-36s | %s\n" "$SG_NAME" "$SG_ID"
+            done <<< "$SG_ROWS"
+          fi
+
+          print_section_gap
+          section_banner "EBS VOLUMES | $DISPLAY_LABEL"
+          printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" "Device Name" "Volume ID" "Type" "SizeGB" "IOPS" "Encrypted"
+          printf "%-14s-+-%-21s-+-%-8s-+-%-8s-+-%-8s-+-%s\n" "--------------" "---------------------" "--------" "--------" "--------" "-----------"
+
+          BLOCK_DEVICE_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].BlockDeviceMappings[]? |
+            [.DeviceName, .Ebs.VolumeId] | @tsv
+          ')"
+
+          if [ -z "${BLOCK_DEVICE_ROWS:-}" ]; then
+            printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" "N/A" "N/A" "N/A" "N/A" "N/A" "No EBS volumes found"
+          else
+            while IFS=$'\t' read -r DEVICE VOLUME_ID; do
+              [ -n "${VOLUME_ID:-}" ] || continue
+
+              VOLUME_JSON="$(aws ec2 describe-volumes \
+                --region "$REGION" \
+                --volume-ids "$VOLUME_ID" \
+                --output json)"
+
+              VTYPE="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].VolumeType // "N/A"')"
+              VSIZE="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Size // "N/A"')"
+              VIOPS="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Iops // "N/A"')"
+              VENCRYPTED="$(echo "$VOLUME_JSON" | jq -r '.Volumes[0].Encrypted // "N/A"')"
+
+              printf "%-14s | %-21s | %-8s | %-8s | %-8s | %s\n" \
+                "$DEVICE" "$VOLUME_ID" "$VTYPE" "$VSIZE" "$VIOPS" "$VENCRYPTED"
+            done <<< "$BLOCK_DEVICE_ROWS"
+          fi
+
+          print_section_gap
+          section_banner "INSTANCE TAGS | $DISPLAY_LABEL"
+          printf "%-30s | %s\n" "Tag Key" "Tag Value"
+          printf "%-30s-+-%s\n" "------------------------------" "-----------------------------------------------------------"
+
+          TAG_ROWS="$(echo "$INSTANCE_JSON" | jq -r '
+            .Reservations[0].Instances[0].Tags[]? |
+            [.Key, .Value] | @tsv
+          ' | sort)"
+
+          if [ -z "${TAG_ROWS:-}" ]; then
+            printf "%-30s | %s\n" "N/A" "No tags found"
+          else
+            while IFS=$'\t' read -r KEY VALUE; do
+              [ -n "${KEY:-}" ] || KEY="N/A"
+              [ -n "${VALUE:-}" ] || VALUE="N/A"
+              printf "%-30s | %s\n" "$KEY" "$VALUE"
+            done <<< "$TAG_ROWS"
+          fi
+
+      - name: 2) SSM Checks
+        shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$REPORT_FILE") 2>&1
+
+          log() {
+            echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"
+          }
+
+          section_banner() {
+            printf "\n=======================================================================\n"
+            printf "%s\n" "$1"
+            printf "=======================================================================\n"
+          }
+
+          print_kv_header() {
+            printf "%-26s | %s\n" "Attribute" "Value"
+            printf "%-26s-+-%s\n" "--------------------------" "---------------------------------------------------------------"
+          }
+
+          print_kv_row() {
+            printf "%-26s | %s\n" "$1" "$2"
+          }
+
+          print_section_gap() {
+            printf "\n"
+          }
+
+          log "Validating SSM document for $DISPLAY_LABEL"
+
+          DOCUMENT_TYPE="$(aws ssm describe-document \
+            --region "$REGION" \
+            --name "$DOCUMENT_NAME" \
+            --query 'Document.DocumentType' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "${DOCUMENT_TYPE:-}" ] || [ "$DOCUMENT_TYPE" = "None" ]; then
+            echo "SSM document not found: $DOCUMENT_NAME" >&2
+            exit 1
+          fi
+
+          if [ "$DOCUMENT_TYPE" != "Command" ]; then
+            echo "SSM document $DOCUMENT_NAME is type '$DOCUMENT_TYPE', but send-command requires type 'Command'." >&2
+            exit 1
+          fi
+
+          log "Sending SSM validation command..."
+
+          if [ -n "${DNS_LOOKUP_NAME:-}" ] && [ "$DNS_LOOKUP_NAME" != "N/A" ]; then
+            COMMAND_ID="$(aws ssm send-command \
+              --region "$REGION" \
+              --document-name "$DOCUMENT_NAME" \
+              --instance-ids "$TARGET_INSTANCE_ID" \
+              --parameters "DnsNameToResolve=$DNS_LOOKUP_NAME" \
+              --query "Command.CommandId" \
+              --output text)"
+          else
+            COMMAND_ID="$(aws ssm send-command \
+              --region "$REGION" \
+              --document-name "$DOCUMENT_NAME" \
+              --instance-ids "$TARGET_INSTANCE_ID" \
+              --query "Command.CommandId" \
+              --output text)"
+          fi
+
+          ATTEMPT=0
+          FINAL_STATUS=""
+
+          while [ "$ATTEMPT" -lt 30 ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            STATUS="$(aws ssm get-command-invocation \
+              --region "$REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$TARGET_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || true)"
+
+            case "$STATUS" in
+              Success)
+                FINAL_STATUS="Success"
+                log "SSM command completed successfully"
+                break
+                ;;
+              Failed|TimedOut|Cancelled|Cancelling)
+                FINAL_STATUS="$STATUS"
+                log "SSM command completed with status: $STATUS"
+                break
+                ;;
+              Pending|InProgress|Delayed|"")
+                log "Waiting for SSM command... attempt $ATTEMPT/30"
+                sleep 6
+                ;;
+              *)
+                log "SSM command current status: $STATUS"
+                sleep 6
+                ;;
+            esac
+          done
+
+          INVOCATION_JSON="$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$TARGET_INSTANCE_ID" \
+            --output json)"
+
+          STANDARD_OUTPUT="$(echo "$INVOCATION_JSON" | jq -r '.StandardOutputContent // ""' | tr -d '\r')"
+          STANDARD_ERROR="$(echo "$INVOCATION_JSON" | jq -r '.StandardErrorContent // ""' | tr -d '\r')"
+          STATUS_DETAILS="$(echo "$INVOCATION_JSON" | jq -r '.StatusDetails // "N/A"')"
+
+          EFFECTIVE_STATUS="${FINAL_STATUS:-$STATUS_DETAILS}"
+
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+          echo "SSM_FINAL_STATUS=$EFFECTIVE_STATUS" >> "$GITHUB_ENV"
+
+          section_banner "SSM CHECKS | $DISPLAY_LABEL"
+          print_kv_header
+          print_kv_row "Command ID" "$COMMAND_ID"
+
+          print_section_gap
+          section_banner "SSM DOCUMENT OUTPUT | $DISPLAY_LABEL"
+          printf "%s\n" "${STANDARD_OUTPUT:-"(no output)"}"
+
+          if [ -n "${STANDARD_ERROR:-}" ]; then
+            print_section_gap
+            section_banner "SSM STANDARD ERROR | $DISPLAY_LABEL"
+            printf "%s\n" "$STANDARD_ERROR"
+          fi
+
+          if [ "$EFFECTIVE_STATUS" != "Success" ]; then
+            echo "SSM details collection failed with status: $EFFECTIVE_STATUS" >&2
+            exit 1
+          fi
+
+          print_section_gap
+          log "Workflow completed successfully for $DISPLAY_LABEL"
+
+      - name: Upload per-server artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ec2-linux-validation-${{ env.SAFE_TARGET }}
+          path: ${{ env.REPORT_FILE }}
+
+  consolidate-review-pack:
+    if: ${{ always() }}
+    needs:
+      - prepare-targets
+      - validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download server artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ec2-linux-validation-*
+          path: review-pack
+          merge-multiple: true
+
+      - name: Build combined review pack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import glob
+          import os
+
+          base = "review-pack"
+          txt_files = sorted(
+              f for f in glob.glob(os.path.join(base, "*.txt"))
+              if not f.endswith("combined-reports.txt")
+          )
+
+          combined_txt = os.path.join(base, "combined-reports.txt")
+
+          with open(combined_txt, "w", encoding="utf-8") as out:
+              if not txt_files:
+                  out.write("No server reports were found.\n")
+              else:
+                  for idx, file in enumerate(txt_files):
+                      if idx > 0:
+                          out.write("\n\n")
+                      with open(file, encoding="utf-8") as src:
+                          out.write(src.read().rstrip() + "\n")
+          PY
+
+      - name: Build artifact name
+        id: artifact_meta
+        shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+          TARGET_COUNT: ${{ needs.prepare-targets.outputs.count }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          TIMESTAMP_UTC="$(date -u +'%Y%m%dT%H%M%SZ')"
+          ARTIFACT_NAME="ec2-linux-validation_${REGION}_${TIMESTAMP_UTC}_${TARGET_COUNT}targets_run${RUN_NUMBER}_try${RUN_ATTEMPT}"
+
+          echo "timestamp_utc=$TIMESTAMP_UTC" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload combined review pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact_meta.outputs.artifact_name }}
+          path: review-pack/combined-reports.txt
