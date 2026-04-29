@@ -530,7 +530,7 @@ jobs:
           set -euo pipefail
 
           echo "======================================================================="
-          echo "COMBINED SERVER OUTPUT"
+          echo "CONSOLIDATED SERVER OUTPUT"
           echo "======================================================================="
           echo
 
