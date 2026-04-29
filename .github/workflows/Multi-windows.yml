@@ -524,22 +524,64 @@ jobs:
                           out.write(src.read().rstrip() + "\n")
           PY
 
-      - name: Display combined review pack
+      - name: Write GitHub step summary
         shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+          TARGET_COUNT: ${{ needs.prepare-targets.outputs.count }}
         run: |
           set -euo pipefail
 
-          echo "======================================================================="
-          echo "CONSOLIDATED SERVER OUTPUT"
-          echo "======================================================================="
-          echo
+          python3 <<'PY'
+          import glob
+          import html
+          import os
 
-          if [ -f review-pack/combined-reports.txt ]; then
-            cat review-pack/combined-reports.txt
-          else
-            echo "combined-reports.txt not found."
-            exit 1
-          fi
+          base = "review-pack"
+          txt_files = sorted(
+              f for f in glob.glob(os.path.join(base, "*.txt"))
+              if not f.endswith("combined-reports.txt")
+          )
+
+          summary_file = os.environ["GITHUB_STEP_SUMMARY"]
+          region = os.getenv("REGION", "N/A")
+          target_count = os.getenv("TARGET_COUNT", "0")
+
+          with open(summary_file, "a", encoding="utf-8") as out:
+              out.write("# Windows EC2 Validation Summary\n\n")
+              out.write(f"- **Region:** {region}\n")
+              out.write(f"- **Targets requested:** {target_count}\n")
+              out.write(f"- **Reports found:** {len(txt_files)}\n\n")
+
+              if not txt_files:
+                  out.write("_No server reports were found._\n")
+              else:
+                  for idx, file in enumerate(txt_files, start=1):
+                      server_name = os.path.splitext(os.path.basename(file))[0]
+
+                      with open(file, encoding="utf-8") as src:
+                          content = src.read().rstrip()
+
+                      if not content:
+                          content = "(empty report)"
+
+                      preview_limit = 12000
+                      truncated = False
+                      if len(content) > preview_limit:
+                          content = content[:preview_limit].rstrip()
+                          truncated = True
+
+                      out.write(f"## {idx}. {server_name}\n\n")
+                      out.write(f"<details><summary>Show output for {html.escape(server_name)}</summary>\n\n")
+                      out.write("```text\n")
+                      out.write(content)
+                      if not content.endswith("\n"):
+                          out.write("\n")
+                      out.write("```\n")
+                      if truncated:
+                          out.write("\n_Full output truncated here in summary. Download the artifact for complete content._\n\n")
+                      out.write("</details>\n\n")
+          PY
 
       - name: Build artifact name
         id: artifact_meta
