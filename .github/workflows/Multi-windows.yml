@@ -532,56 +532,54 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 <<'PY'
-          import glob
-          import html
-          import os
+          echo "Writing GitHub Step Summary to: $GITHUB_STEP_SUMMARY"
 
-          base = "review-pack"
-          txt_files = sorted(
-              f for f in glob.glob(os.path.join(base, "*.txt"))
-              if not f.endswith("combined-reports.txt")
-          )
+          {
+            echo "# Linux EC2 Validation Summary"
+            echo
+            echo "- **Region:** ${REGION}"
+            echo "- **Targets requested:** ${TARGET_COUNT}"
+            echo
 
-          summary_file = os.environ["GITHUB_STEP_SUMMARY"]
-          region = os.getenv("REGION", "N/A")
-          target_count = os.getenv("TARGET_COUNT", "0")
+            shopt -s nullglob
+            files=(review-pack/*.txt)
 
-          with open(summary_file, "a", encoding="utf-8") as out:
-              out.write("# Windows EC2 Validation Summary\n\n")
-              out.write(f"- **Region:** {region}\n")
-              out.write(f"- **Targets requested:** {target_count}\n")
-              out.write(f"- **Reports found:** {len(txt_files)}\n\n")
+            report_count=0
+            for file in "${files[@]}"; do
+              if [[ "$(basename "$file")" == "combined-reports.txt" ]]; then
+                continue
+              fi
 
-              if not txt_files:
-                  out.write("_No server reports were found._\n")
-              else:
-                  for idx, file in enumerate(txt_files, start=1):
-                      server_name = os.path.splitext(os.path.basename(file))[0]
+              report_count=$((report_count + 1))
 
-                      with open(file, encoding="utf-8") as src:
-                          content = src.read().rstrip()
+              raw_name="$(basename "$file" .txt)"
+              display_label="$(grep -m1 '^Server post configuration validations | ' "$file" | awk -F ' \\| ' '{print $2 " | " $3}' || true)"
 
-                      if not content:
-                          content = "(empty report)"
+              if [[ -z "${display_label:-}" || "${display_label}" == " | " ]]; then
+                display_label="$raw_name"
+              fi
 
-                      preview_limit = 12000
-                      truncated = False
-                      if len(content) > preview_limit:
-                          content = content[:preview_limit].rstrip()
-                          truncated = True
+              echo "## ${report_count}. ${display_label}"
+              echo
+              echo "<details><summary>Show output for ${display_label}</summary>"
+              echo
+              echo '```text'
+              head -c 12000 "$file"
+              echo
+              echo '```'
+              echo "</details>"
+              echo
+            done
 
-                      out.write(f"## {idx}. {server_name}\n\n")
-                      out.write(f"<details><summary>Show output for {html.escape(server_name)}</summary>\n\n")
-                      out.write("```text\n")
-                      out.write(content)
-                      if not content.endswith("\n"):
-                          out.write("\n")
-                      out.write("```\n")
-                      if truncated:
-                          out.write("\n_Full output truncated here in summary. Download the artifact for complete content._\n\n")
-                      out.write("</details>\n\n")
-          PY
+            echo "- **Reports found:** ${report_count}"
+
+            if [[ "$report_count" -eq 0 ]]; then
+              echo
+              echo "_No server reports were found._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Step summary write complete."
 
       - name: Build artifact name
         id: artifact_meta
