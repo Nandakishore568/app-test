@@ -1,4 +1,4 @@
-name: Centralized Multi Windows EC2 Validation
+name: Centralized Multi Linux EC2 Validation
 
 on:
   workflow_dispatch:
@@ -43,6 +43,7 @@ jobs:
 
           deduped = []
           seen = set()
+
           for item in items:
               if item not in seen:
                   seen.add(item)
@@ -68,7 +69,7 @@ jobs:
       contents: read
 
     env:
-      DOCUMENT_NAME: "Centralized-Windows-EC2-Validation"
+      DOCUMENT_NAME: "Centralized-Linux-EC2-Validation"
 
     steps:
       - name: Configure AWS credentials
@@ -478,7 +479,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: ec2-validation-${{ env.SAFE_TARGET }}
+          name: ec2-linux-validation-${{ env.SAFE_TARGET }}
           path: ${{ env.REPORT_FILE }}
 
   consolidate-review-pack:
@@ -492,7 +493,7 @@ jobs:
       - name: Download server artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ec2-validation-*
+          pattern: ec2-linux-validation-*
           path: review-pack
           merge-multiple: true
 
@@ -535,7 +536,7 @@ jobs:
         run: |
           set -euo pipefail
           TIMESTAMP_UTC="$(date -u +'%Y%m%dT%H%M%SZ')"
-          ARTIFACT_NAME="ec2-validation_${REGION}_${TIMESTAMP_UTC}_${TARGET_COUNT}targets_run${RUN_NUMBER}_try${RUN_ATTEMPT}"
+          ARTIFACT_NAME="ec2-linux-validation_${REGION}_${TIMESTAMP_UTC}_${TARGET_COUNT}targets_run${RUN_NUMBER}_try${RUN_ATTEMPT}"
 
           echo "timestamp_utc=$TIMESTAMP_UTC" >> "$GITHUB_OUTPUT"
           echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
