@@ -534,48 +534,52 @@ jobs:
 
           echo "Writing GitHub Step Summary to: $GITHUB_STEP_SUMMARY"
 
+          shopt -s nullglob
+          all_files=(review-pack/*.txt)
+          files=()
+
+          for file in "${all_files[@]}"; do
+            if [[ "$(basename "$file")" == "combined-reports.txt" ]]; then
+              continue
+            fi
+            files+=("$file")
+          done
+
+          report_count="${#files[@]}"
+
           {
-            echo "# Linux EC2 Validation Summary"
+            echo "# Windows EC2 Validation Summary"
             echo
             echo "- **Region:** ${REGION}"
             echo "- **Targets requested:** ${TARGET_COUNT}"
+            echo "- **Reports found:** ${report_count}"
             echo
 
-            shopt -s nullglob
-            files=(review-pack/*.txt)
-
-            report_count=0
-            for file in "${files[@]}"; do
-              if [[ "$(basename "$file")" == "combined-reports.txt" ]]; then
-                continue
-              fi
-
-              report_count=$((report_count + 1))
-
-              raw_name="$(basename "$file" .txt)"
-              display_label="$(grep -m1 '^Server post configuration validations | ' "$file" | awk -F ' \\| ' '{print $2 " | " $3}' || true)"
-
-              if [[ -z "${display_label:-}" || "${display_label}" == " | " ]]; then
-                display_label="$raw_name"
-              fi
-
-              echo "## ${report_count}. ${display_label}"
-              echo
-              echo "<details><summary>Show output for ${display_label}</summary>"
-              echo
-              echo '```text'
-              head -c 12000 "$file"
-              echo
-              echo '```'
-              echo "</details>"
-              echo
-            done
-
-            echo "- **Reports found:** ${report_count}"
-
             if [[ "$report_count" -eq 0 ]]; then
-              echo
               echo "_No server reports were found._"
+            else
+              index=0
+              for file in "${files[@]}"; do
+                index=$((index + 1))
+
+                raw_name="$(basename "$file" .txt)"
+                display_label="$(grep -m1 '^Server post configuration validations | ' "$file" | awk -F ' \\| ' '{print $2 " | " $3}' || true)"
+
+                if [[ -z "${display_label:-}" || "${display_label}" == " | " ]]; then
+                  display_label="$raw_name"
+                fi
+
+                echo "## ${index}. ${display_label}"
+                echo
+                echo "<details><summary>Show output for ${display_label}</summary>"
+                echo
+                echo '```text'
+                head -c 12000 "$file"
+                echo
+                echo '```'
+                echo "</details>"
+                echo
+              done
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
