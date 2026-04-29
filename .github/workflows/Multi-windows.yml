@@ -524,6 +524,23 @@ jobs:
                           out.write(src.read().rstrip() + "\n")
           PY
 
+      - name: Display combined review pack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "======================================================================="
+          echo "COMBINED SERVER OUTPUT"
+          echo "======================================================================="
+          echo
+
+          if [ -f review-pack/combined-reports.txt ]; then
+            cat review-pack/combined-reports.txt
+          else
+            echo "combined-reports.txt not found."
+            exit 1
+          fi
+
       - name: Build artifact name
         id: artifact_meta
         shell: bash
